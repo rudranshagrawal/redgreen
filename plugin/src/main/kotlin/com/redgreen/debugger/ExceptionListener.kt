@@ -8,26 +8,25 @@ import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.xdebugger.XDebugProcess
 import com.intellij.xdebugger.XDebugSession
 import com.intellij.xdebugger.XDebugSessionListener
-import com.intellij.xdebugger.XDebuggerManager
 import com.intellij.xdebugger.XDebuggerManagerListener
+import com.intellij.xdebugger.frame.XExecutionStack
+import com.intellij.xdebugger.frame.XStackFrame
 import com.redgreen.AnalyzePayload
 import com.redgreen.RedGreenController
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
- * Fires when the PyCharm debugger pauses. If the pause looks like an
- * exception (vs. a manual breakpoint), we build an AnalyzePayload from the
- * top stack frame and hand it to the controller.
+ * Fires when the PyCharm debugger pauses.
  *
- * There is no perfect "was this an exception" signal across the XDebugger
- * API, so we use a pragmatic heuristic:
- *  - if the suspend context's stack frames exist AND
- *  - the active stack frame's position points at a line that exists in a
- *    readable source file
- *  - we fire.
- *
- * False positives (i.e. firing on a plain breakpoint) are cheap: the user
- * just dismisses the tool window. False negatives (missing an exception)
- * are what we care about; we bias toward firing.
+ * Frame selection strategy (critical for usefulness):
+ *   1. If the TOP frame's source file is inside the user's project, use it.
+ *   2. Otherwise walk the stack top-to-bottom, pick the first frame that IS
+ *      inside the project. This handles the common case where an exception
+ *      surfaces deep in a library but the user's code is further down.
+ *   3. If NO project frame exists anywhere in the stack (e.g. SyntaxError
+ *      raised from PyCharm's own exec(compile()) helper), skip firing —
+ *      we have nothing productive to say.
  */
 class RedGreenDebuggerManagerListener(private val project: Project) : XDebuggerManagerListener {
     private val log = Logger.getInstance(RedGreenDebuggerManagerListener::class.java)
@@ -51,12 +50,17 @@ private class RedGreenSessionListener(
         // Throttle: don't fire twice within 5s for the same session.
         val now = System.currentTimeMillis()
         if (now - lastFiredAt < 5_000) return
-        lastFiredAt = now
 
         val payload = ReadAction.compute<AnalyzePayload?, Throwable> {
             buildPayloadFromSession(session)
-        } ?: return
+        }
 
+        if (payload == null) {
+            log.info("RedGreen: skipping this pause — no user-project frame in the stack")
+            return
+        }
+
+        lastFiredAt = now
         log.info("RedGreen: session paused at ${payload.frame_file}:${payload.frame_line} — kicking off analyze")
         ApplicationManager.getApplication().executeOnPooledThread {
             RedGreenController(project).analyze(payload)
@@ -66,16 +70,25 @@ private class RedGreenSessionListener(
 
 
 private fun buildPayloadFromSession(session: XDebugSession): AnalyzePayload? {
-    val frame = session.currentStackFrame ?: return null
-    val pos = frame.sourcePosition ?: return null
+    val project = session.project
+    val base = project.basePath ?: return null
+
+    // Prefer the current (top) frame if it's inside the project — cheap path.
+    val topFrame = session.currentStackFrame
+    val topPos = topFrame?.sourcePosition
+    val topPath = topPos?.file?.path
+    val selected = if (topPath != null && isProjectPath(topPath, base)) {
+        topFrame
+    } else {
+        // Walk the stack for the first user-project frame.
+        findFirstProjectFrame(session, base)
+    } ?: return null
+
+    val pos = selected.sourcePosition ?: return null
     val file: VirtualFile = pos.file
     val line = pos.line + 1  // XSourcePosition is 0-based
 
-    val project = session.project
-    val base = project.basePath ?: return null
-    val absPath = file.path
-    val relPath = if (absPath.startsWith("$base/")) absPath.removePrefix("$base/") else absPath
-
+    val relPath = file.path.removePrefix("$base/")
     val text = try {
         String(file.contentsToByteArray())
     } catch (t: Throwable) {
@@ -86,12 +99,11 @@ private fun buildPayloadFromSession(session: XDebugSession): AnalyzePayload? {
     val hi = minOf(lines.size, line - 1 + 20)
     val frameSource = (lo until hi).joinToString("\n") { "%4d: %s".format(it + 1, lines[it]) }
 
-    // Hand-assemble a Python-style stacktrace from the session's execution stack.
-    val trace = buildSyntheticStacktrace(session)
+    val trace = buildSyntheticStacktrace(file.path, line, selected === topFrame)
 
     return AnalyzePayload(
         stacktrace = trace,
-        locals_json = emptyMap(),  // TODO: read XStackFrame's children via debuggerSession.
+        locals_json = emptyMap(),
         frame_file = relPath,
         frame_line = line,
         frame_source = frameSource,
@@ -101,23 +113,59 @@ private fun buildPayloadFromSession(session: XDebugSession): AnalyzePayload? {
 }
 
 
-private fun buildSyntheticStacktrace(session: XDebugSession): String {
-    // XDebugger exposes the execution stack, but walking it into a clean
-    // Python-style traceback across all languages is intricate. For the
-    // hackathon we emit a compact, human-readable marker — the frame_file /
-    // frame_line in the payload are what the backend actually relies on to
-    // build prompt context.
-    val frame = session.currentStackFrame ?: return "Paused in debugger (no frame info)."
-    val pos = frame.sourcePosition
-    val path = pos?.file?.path ?: "unknown"
-    val line = (pos?.line ?: -1) + 1
-    return """
-        Debugger paused at the top frame. RedGreen is treating this as the failure site.
+private fun isProjectPath(absPath: String, base: String): Boolean {
+    return absPath.startsWith("$base/") &&
+        // Reject common virtual-root locations that land under a project but aren't user code.
+        !absPath.contains("/.gradle/") &&
+        !absPath.contains("/.venv/") &&
+        !absPath.contains("/node_modules/") &&
+        !absPath.contains("/build/") &&
+        !absPath.contains("/dist/")
+}
 
-          File "$path", line $line, in <paused-frame>
+
+/**
+ * Blocking walk of the execution stack to find the first frame whose file
+ * lives inside the user's project. The XDebugger API is async; we rendezvous
+ * through a CountDownLatch with a 2-second ceiling.
+ */
+private fun findFirstProjectFrame(session: XDebugSession, base: String): XStackFrame? {
+    val stack: XExecutionStack = session.suspendContext?.activeExecutionStack ?: return null
+    val collected = mutableListOf<XStackFrame>()
+    val done = CountDownLatch(1)
+
+    val container = object : XExecutionStack.XStackFrameContainer {
+        override fun addStackFrames(frames: MutableList<out XStackFrame>, last: Boolean) {
+            collected.addAll(frames)
+            if (last) done.countDown()
+        }
+        override fun errorOccurred(errorMessage: String) {
+            done.countDown()
+        }
+    }
+    stack.computeStackFrames(0, container)
+    done.await(2, TimeUnit.SECONDS)
+
+    return collected.firstOrNull { frame ->
+        val path = frame.sourcePosition?.file?.path ?: return@firstOrNull false
+        isProjectPath(path, base)
+    }
+}
+
+
+private fun buildSyntheticStacktrace(path: String, line: Int, isTopFrame: Boolean): String {
+    val note = if (isTopFrame) {
+        "Debugger paused at the current top frame — the raising line."
+    } else {
+        "Debugger paused deep in framework code; RedGreen walked the stack to this user frame."
+    }
+    return """
+        $note
+
+          File "$path", line $line, in <user-frame>
             (live frame — see frame_source for the surrounding code)
 
-        Exception type: inferred from debugger pause. If this was a manual breakpoint,
-        dismiss the RedGreen panel; no harm done.
+        Exception type inferred from debugger pause. If this was a manual
+        breakpoint (not an exception), dismiss the panel — no harm done.
     """.trimIndent()
 }

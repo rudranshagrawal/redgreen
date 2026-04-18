@@ -76,11 +76,15 @@ class RedGreenToolWindow(private val project: Project) {
         rowHeight = 28
         selectionModel.selectionMode = ListSelectionModel.SINGLE_SELECTION
         setDefaultRenderer(Any::class.java, winnerRowRenderer)
-        columnModel.getColumn(0).preferredWidth = 130
-        columnModel.getColumn(1).preferredWidth = 260
-        columnModel.getColumn(2).preferredWidth = 220
-        columnModel.getColumn(3).preferredWidth = 80
-        columnModel.getColumn(4).preferredWidth = 400
+        // Fixed column widths + horizontal scroll when the tool window is narrow.
+        // Previously columns auto-shrank to "M..." "P..." — unreadable.
+        autoResizeMode = JTable.AUTO_RESIZE_OFF
+        tableHeader.reorderingAllowed = false
+        columnModel.getColumn(0).apply { preferredWidth = 220; minWidth = 180 }
+        columnModel.getColumn(1).apply { preferredWidth = 260; minWidth = 160 }
+        columnModel.getColumn(2).apply { preferredWidth = 260; minWidth = 200 }
+        columnModel.getColumn(3).apply { preferredWidth = 90;  minWidth = 70 }
+        columnModel.getColumn(4).apply { preferredWidth = 420; minWidth = 160 }
         // Status column uses the phase-aware renderer.
         columnModel.getColumn(2).cellRenderer = statusRenderer
         selectionModel.addListSelectionListener { e ->

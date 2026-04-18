@@ -40,28 +40,43 @@ def _log(msg: str) -> None:
 
 
 def _apply_unified_diff(repo_root: pathlib.Path, diff_text: str) -> None:
-    """Apply a unified diff using the stdlib — no `patch` binary in the image.
+    """Apply a unified diff using context-based search & replace.
 
-    Supports simple single-file patches of the form emitted by git: `--- a/...`,
-    `+++ b/...`, `@@ -a,b +c,d @@` hunks. That is sufficient for RedGreen's
-    bounded patches (one function in one file).
+    We intentionally IGNORE the line numbers in `@@` headers — real models
+    emit stale, wrong, or entirely missing coordinates. The hunk body itself
+    contains enough context: the sequence of ` ` + `-` lines must appear
+    verbatim in the target file, and we replace it with the sequence of
+    ` ` + `+` lines.
+
+    Supports:
+      - `@@` with or without line numbers
+      - multiple hunks per file
+      - multiple files per diff
+      - new-file creation (`--- /dev/null`)
     """
     current_file: pathlib.Path | None = None
-    hunks: list[tuple[int, list[str]]] = []  # (start_line_in_original, lines)
+    hunks: list[list[str]] = []
     active_hunk: list[str] | None = None
-    active_start = 0
+    file_is_new = False
 
     def flush_file() -> None:
         nonlocal current_file, hunks
         if current_file is None:
             return
-        _apply_hunks_to_file(current_file, hunks)
+        if file_is_new:
+            # New-file hunk: just write the "+" lines.
+            new_lines = [ln[1:] for h in hunks for ln in h if ln.startswith("+")]
+            current_file.parent.mkdir(parents=True, exist_ok=True)
+            current_file.write_text("\n".join(new_lines) + ("\n" if new_lines else ""))
+        else:
+            _apply_hunks_to_file(current_file, hunks)
         current_file = None
         hunks = []
 
     for line in diff_text.splitlines():
         if line.startswith("--- "):
             flush_file()
+            file_is_new = line[4:].strip() in ("/dev/null", "a//dev/null")
         elif line.startswith("+++ "):
             target = line[4:].strip()
             if target.startswith("b/"):
@@ -71,37 +86,54 @@ def _apply_unified_diff(repo_root: pathlib.Path, diff_text: str) -> None:
             else:
                 current_file = repo_root / target
         elif line.startswith("@@"):
-            m = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
-            if not m:
-                raise ValueError(f"malformed hunk header: {line!r}")
-            active_start = int(m.group(1))
             active_hunk = []
-            hunks.append((active_start, active_hunk))
-        elif active_hunk is not None and (line.startswith("+") or line.startswith("-") or line.startswith(" ")):
+            hunks.append(active_hunk)
+        elif active_hunk is not None and line and line[0] in ("+", "-", " "):
             active_hunk.append(line)
+        # Silently ignore other lines (e.g., `diff --git`, `index ...`, blank lines).
 
     flush_file()
 
 
-def _apply_hunks_to_file(path: pathlib.Path, hunks: list[tuple[int, list[str]]]) -> None:
-    original = path.read_text().splitlines(keepends=False) if path.exists() else []
-    # Apply hunks from bottom to top so earlier line numbers stay valid.
-    for start, lines in sorted(hunks, key=lambda h: -h[0]):
-        orig_idx = start - 1
-        new_block: list[str] = []
-        for entry in lines:
-            tag, content = entry[0], entry[1:]
-            if tag == " ":
-                new_block.append(content)
-                orig_idx += 1
-            elif tag == "-":
-                orig_idx += 1
-            elif tag == "+":
-                new_block.append(content)
-        consumed = sum(1 for e in lines if e and e[0] in (" ", "-"))
-        original[start - 1:start - 1 + consumed] = new_block
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(original) + ("\n" if original else ""))
+def _apply_hunks_to_file(path: pathlib.Path, hunks: list[list[str]]) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"patch targets missing file: {path}")
+    original_text = path.read_text()
+    original_lines = original_text.splitlines()
+
+    for hunk in hunks:
+        if not hunk:
+            continue
+        before = [ln[1:] for ln in hunk if ln and ln[0] in (" ", "-")]
+        after = [ln[1:] for ln in hunk if ln and ln[0] in (" ", "+")]
+
+        if not before:
+            # Pure-insertion hunk: unsafe without an anchor. Refuse.
+            raise ValueError("pure-insertion hunk without context — cannot locate")
+
+        idx = _find_subsequence(original_lines, before)
+        if idx < 0:
+            # Try tolerating trailing-whitespace / tab diffs.
+            idx = _find_subsequence(
+                [s.rstrip() for s in original_lines],
+                [s.rstrip() for s in before],
+            )
+        if idx < 0:
+            raise ValueError(f"hunk does not match any location; first before-line: {before[0]!r}")
+
+        original_lines[idx:idx + len(before)] = after
+
+    trailing_nl = "\n" if original_text.endswith("\n") else ""
+    path.write_text("\n".join(original_lines) + trailing_nl)
+
+
+def _find_subsequence(haystack: list[str], needle: list[str]) -> int:
+    if not needle or len(needle) > len(haystack):
+        return -1
+    for i in range(0, len(haystack) - len(needle) + 1):
+        if haystack[i:i + len(needle)] == needle:
+            return i
+    return -1
 
 
 def _run_pytest(repo_root: pathlib.Path, target: str) -> tuple[int, str, int]:

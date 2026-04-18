@@ -17,10 +17,14 @@ bootstrap:
     .venv/bin/pip install --upgrade pip
     .venv/bin/pip install pydantic fastapi uvicorn httpx openai supabase python-dotenv
 
-# Verify env + reachability for the things the demo depends on.
+# Quick env + reachability sanity check (fast subset of `verify`).
 check:
     {{PY}} -c "from contracts.schemas import AnalyzeRequest, RunRequest, StatusResponse; print('contracts ok')"
     @{{PY}} -c "import os; missing=[k for k in ('OPENAI_API_KEY','NEBIUS_API_KEY','SUPABASE_URL','SUPABASE_SERVICE_ROLE_KEY') if not os.environ.get(k)]; print('env missing:', missing) if missing else print('env ok')"
+
+# Full pre-commit gate: contracts + env + reachability + docker + seeds. Must pass before backend/runner/plugin commits (hard rule #10).
+verify:
+    bash scripts/verify.sh
 
 # Bring up backend + runner + web for local dev.
 dev:

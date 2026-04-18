@@ -100,6 +100,45 @@ Plugin code and backend code only meet at `contracts/`. Never import across the 
 6. **Every new bug type needs a seed repo that RED→GREENs reliably** under `just test-seed`.
 7. **Freeze contracts at M0.** If a schema change is truly needed, bump a version and update both sides in one commit.
 8. **Do not start the dev server / runner / plugin sandbox unless asked.** Long-running processes should be intentional.
+9. **Failing test first.** Before writing or changing orchestrator / provider / runner logic, write or update the test or seed that would catch the failure. The whole product is a TDD loop — we eat our own dog food.
+10. **`just verify` must pass before every commit that changes backend/runner/plugin code.** If it doesn't pass, the commit doesn't land.
+
+## When something breaks — 4-phase debug loop
+
+Applies when *building* RedGreen stalls (not when the product detects a user's bug — that's the runner's job). Adapted from ECC agent-introspection. Use before asking the user for help.
+
+**Phase 1 — Capture** (write it down, don't just stew):
+- What was the goal? Which milestone + sub-task?
+- Exact error / unexpected output (paste verbatim).
+- Last tool call that worked. Last tool call that failed.
+- Environment assumptions that could be wrong (cwd, docker state, env vars loaded, supabase reachable).
+
+**Phase 2 — Diagnose** (pattern-match):
+
+| Symptom | Likely cause | First check |
+|---------|--------------|-------------|
+| Same command retried, same failure | Logic error, not env | Read the stacktrace, not the last line |
+| `ECONNREFUSED` to Docker | Daemon not running | `docker info` |
+| `401/403` from OpenAI/Nebius/Supabase | Wrong env var loaded | `echo ${VAR}` from the venv's shell |
+| Runner returns ERROR with "patch apply failed" | Diff format the runner doesn't support | Look at the generated diff; maybe regen or loosen parser |
+| Runner returns ERROR on RED gate | Generated test doesn't reproduce | Inspect `test_code`; usually prompt issue, not runner issue |
+| pytest passes when it should fail | Test is too lenient (`assert True`) | Harden the RED gate assertion in the prompt |
+| Supabase insert silently drops rows | Enum mismatch or RLS | Check payload vs `schema.sql`; re-run `just verify` |
+
+**Phase 3 — Contain**: smallest reversible action. Don't change two things at once. If unsure, back out the change first, confirm green, then retry one thing.
+
+**Phase 4 — Introspect**: before calling the bug fixed, check: did we fix the right thing, or just make the error go away? Run `just verify` again. Re-read the original capture.
+
+## Context compaction plan
+
+Long hackathon sessions → context gets polluted. Compact at these boundaries, NOT mid-implementation:
+
+- After M1 green → compact (drop exploration, keep CLAUDE.md + contracts).
+- After M2 green → compact.
+- After M3 green (or kill-switch fires) → compact.
+- Before recording the demo (M7) → compact and reload the demo script.
+
+Do NOT compact mid-implementation — losing variable names and open file paths is expensive. If the user is not sure, defer.
 
 ## Fallback decision tree (M3 kill-switch)
 

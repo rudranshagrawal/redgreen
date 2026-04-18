@@ -15,6 +15,10 @@ repositories {
 }
 
 dependencies {
+    // Gson is bundled with the IntelliJ Platform; declaring compileOnly so we
+    // don't duplicate it at runtime.
+    compileOnly("com.google.code.gson:gson:2.10.1")
+
     intellijPlatform {
         // Target PyCharm Community 2024.3 for the debugger hook + Python source support.
         pycharmCommunity("2024.3")

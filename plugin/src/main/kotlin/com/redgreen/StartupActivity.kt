@@ -2,14 +2,19 @@ package com.redgreen
 
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.startup.ProjectActivity
+import com.intellij.xdebugger.XDebuggerManager
+import com.redgreen.debugger.RedGreenDebuggerManagerListener
 
 /**
- * Placeholder project-activity hook. M3.4 will wire the XDebuggerManager listener
- * here so exception breakpoints trigger an analyze automatically.
+ * On project open, subscribe to XDebuggerManager.TOPIC so the plugin sees
+ * every new debug session as it starts and can attach per-session listeners.
  */
 class StartupActivity : ProjectActivity {
     override suspend fun execute(project: Project) {
-        // Initialize the project service so it's ready when the debugger fires.
         RedGreenService.getInstance(project)
+        project.messageBus.connect().subscribe(
+            XDebuggerManager.TOPIC,
+            RedGreenDebuggerManagerListener(project),
+        )
     }
 }

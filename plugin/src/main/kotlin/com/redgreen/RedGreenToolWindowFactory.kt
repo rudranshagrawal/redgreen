@@ -1,6 +1,5 @@
 package com.redgreen
 
-import com.intellij.openapi.editor.colors.EditorColorsManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowFactory
@@ -16,10 +15,10 @@ import java.awt.BorderLayout
 import java.awt.Component
 import java.awt.Dimension
 import java.awt.Font
-import java.awt.GridBagConstraints
-import java.awt.GridBagLayout
 import javax.swing.BorderFactory
+import javax.swing.JSplitPane
 import javax.swing.JTable
+import javax.swing.JTextArea
 import javax.swing.ListSelectionModel
 import javax.swing.table.DefaultTableCellRenderer
 import javax.swing.table.DefaultTableModel
@@ -36,50 +35,88 @@ class RedGreenToolWindowFactory : ToolWindowFactory {
 
 
 /**
- * Tool window UI, driven by RedGreenController.
- *
- * State machine:
- *   IDLE            -> header only, help text
- *   ANALYZING       -> header + episode metadata + "reaching backend..."
- *   RACING          -> header + episode metadata + 4-row agent table (live)
- *   COMPLETED_WIN   -> all of the above + winner panel (patch preview + apply)
- *   COMPLETED_NONE  -> header + agent table + "no winner" banner
- *   ERROR           -> header + error banner
+ * Tool window UI. All updates arrive through the set* methods below; none of
+ * them assume any particular calling thread — callers (the controller) are
+ * responsible for invokeLater-ing into the EDT.
  */
 class RedGreenToolWindow(private val project: Project) {
 
-    private val headerStatus = JBLabel("RedGreen is idle.").apply {
-        border = BorderFactory.createEmptyBorder(0, 0, 4, 0)
+    // ---------- top strip: title + subtitle + context ----------
+
+    private val title = JBLabel("RedGreen · 4-agent race").apply {
+        font = JBFont.h3()
+        border = BorderFactory.createEmptyBorder(0, 0, 2, 0)
+    }
+    private val subtitle = JBLabel("Idle — run your code in Debug.").apply {
         font = JBFont.label().asBold()
     }
-    private val episodeMeta = JBLabel(" ").apply {
-        foreground = JBColor.GRAY
+    private val contextLine = JBLabel(" ").apply {
         font = JBFont.small()
+        foreground = JBColor.GRAY
+        border = BorderFactory.createEmptyBorder(2, 0, 6, 0)
     }
 
+    // ---------- middle: 4-row race table ----------
+
     private val agentTableModel = object : DefaultTableModel(
-        arrayOf("Agent", "Model", "Status", "Time", "Note"), 0
+        arrayOf("Agent", "Model", "Phase", "Time", "Note"), 0,
     ) {
         override fun isCellEditable(row: Int, col: Int): Boolean = false
     }
 
+    private var winnerAgentName: String? = null
+    private var lastStatus: StatusResponse? = null
+
+    private val statusRenderer = StatusCellRenderer { winnerAgentName }
+    private val winnerRowRenderer = WinnerRowRenderer { winnerAgentName }
+
     private val agentTable = JBTable(agentTableModel).apply {
         setShowGrid(false)
         intercellSpacing = Dimension(0, 0)
-        setDefaultRenderer(Any::class.java, StatusCellRenderer)
-        rowHeight = 26
+        rowHeight = 28
         selectionModel.selectionMode = ListSelectionModel.SINGLE_SELECTION
-        columnModel.getColumn(0).preferredWidth = 110
-        columnModel.getColumn(1).preferredWidth = 200
-        columnModel.getColumn(2).preferredWidth = 90
-        columnModel.getColumn(3).preferredWidth = 60
-        columnModel.getColumn(4).preferredWidth = 300
+        setDefaultRenderer(Any::class.java, winnerRowRenderer)
+        columnModel.getColumn(0).preferredWidth = 130
+        columnModel.getColumn(1).preferredWidth = 260
+        columnModel.getColumn(2).preferredWidth = 220
+        columnModel.getColumn(3).preferredWidth = 80
+        columnModel.getColumn(4).preferredWidth = 400
+        // Status column uses the phase-aware renderer.
+        columnModel.getColumn(2).cellRenderer = statusRenderer
+        selectionModel.addListSelectionListener { e ->
+            if (!e.valueIsAdjusting) refreshDetailsPane()
+        }
     }
+
+    // ---------- details pane: shown below table, shows selected agent detail ----------
+
+    private val detailHeader = JBLabel("Select an agent to see details.").apply {
+        font = JBFont.label().asBold()
+        border = BorderFactory.createEmptyBorder(8, 0, 4, 0)
+    }
+    private val detailBody = JTextArea().apply {
+        isEditable = false
+        lineWrap = true
+        wrapStyleWord = true
+        font = Font("Monospaced", Font.PLAIN, 12)
+    }
+    private val detailPane: JBPanel<JBPanel<*>> = JBPanel<JBPanel<*>>(BorderLayout()).apply {
+        border = JBUI.Borders.compound(
+            BorderFactory.createMatteBorder(1, 0, 0, 0, JBColor.border()),
+            JBUI.Borders.empty(6, 0, 0, 0),
+        )
+        add(detailHeader, BorderLayout.NORTH)
+        add(JBScrollPane(detailBody).apply { preferredSize = Dimension(400, 120) }, BorderLayout.CENTER)
+    }
+
+    // ---------- bottom: winner panel ----------
 
     private val winnerPanel = WinnerPanel(project) { showIdle() }
 
+    // ---------- banner (for no_winner / errors) ----------
+
     private val banner = JBLabel(" ").apply {
-        border = BorderFactory.createEmptyBorder(6, 0, 6, 0)
+        border = BorderFactory.createEmptyBorder(4, 0, 4, 0)
     }
 
     val root: JBPanel<JBPanel<*>> = JBPanel<JBPanel<*>>(BorderLayout()).apply {
@@ -87,15 +124,23 @@ class RedGreenToolWindow(private val project: Project) {
 
         val top = JBPanel<JBPanel<*>>()
         top.layout = javax.swing.BoxLayout(top, javax.swing.BoxLayout.Y_AXIS)
-        top.add(wrap(JBLabel("RedGreen · 4-agent race").apply { font = JBFont.h3() }))
-        top.add(wrap(headerStatus))
-        top.add(wrap(episodeMeta))
+        top.add(wrap(title))
+        top.add(wrap(subtitle))
+        top.add(wrap(contextLine))
         top.add(wrap(banner))
         add(top, BorderLayout.NORTH)
 
-        add(JBScrollPane(agentTable), BorderLayout.CENTER)
-        add(winnerPanel.root, BorderLayout.SOUTH)
+        val center = JSplitPane(JSplitPane.VERTICAL_SPLIT).apply {
+            topComponent = JBScrollPane(agentTable)
+            bottomComponent = detailPane
+            resizeWeight = 0.55
+            isContinuousLayout = true
+            dividerSize = 4
+            border = BorderFactory.createEmptyBorder()
+        }
+        add(center, BorderLayout.CENTER)
 
+        add(winnerPanel.root, BorderLayout.SOUTH)
         winnerPanel.root.isVisible = false
     }
 
@@ -107,59 +152,68 @@ class RedGreenToolWindow(private val project: Project) {
     // ---------- state transitions ----------
 
     fun showIdle() {
-        headerStatus.text = "Idle. Run your code in Debug to catch the next exception."
-        episodeMeta.text = " "
-        clearAgents()
+        subtitle.text = "Idle — run your code in Debug."
+        contextLine.text = "When the debugger trips an exception, RedGreen fires automatically."
         banner.text = " "
+        winnerAgentName = null
+        clearAgents()
         winnerPanel.root.isVisible = false
+        detailHeader.text = "Select an agent to see details."
+        detailBody.text = ""
     }
 
     fun showAnalyzing(payload: AnalyzePayload) {
-        headerStatus.text = "Analyzing exception…"
-        episodeMeta.text = "${payload.frame_file}:${payload.frame_line}"
-        banner.text = "Preparing request — snapshotting repo…"
-        banner.foreground = JBColor.GRAY
+        subtitle.text = "Captured exception — preparing race…"
+        contextLine.text = "${payload.frame_file}:${payload.frame_line}"
+        banner.text = " "
+        winnerAgentName = null
         clearAgents()
+        // Seed the 4 expected lanes so the table doesn't flash empty.
+        for ((agent, model) in DEFAULT_POOL) {
+            agentTableModel.addRow(arrayOf<Any>(humanAgentName(agent), model, "queued", "—", ""))
+        }
         winnerPanel.root.isVisible = false
+        detailHeader.text = "Select an agent to see details."
+        detailBody.text = ""
     }
 
     fun showRacing(episodeId: String) {
-        headerStatus.text = "Racing 4 agents in parallel…"
-        banner.text = "episode $episodeId"
-        banner.foreground = JBColor.GRAY
+        subtitle.text = "Racing 4 agents in parallel…"
+        // The placeholder episode id is an internal artifact; don't show it.
+        if (!episodeId.startsWith("pending-")) {
+            contextLine.text = "${contextLine.text.substringBefore(" · ")} · episode ${episodeId.take(8)}"
+        }
     }
 
     fun showStatus(status: StatusResponse) {
-        // Pre-populate the table with placeholder rows on first update so the
-        // user always sees 4 lanes even before any agent has reported.
-        if (agentTableModel.rowCount < 4 && status.agents.isNotEmpty()) {
-            clearAgents()
-            status.agents.forEach(::appendOrUpdateAgent)
-        } else {
-            status.agents.forEach(::appendOrUpdateAgent)
-        }
+        lastStatus = status
+        status.agents.forEach(::appendOrUpdateAgent)
 
         when (status.state) {
             "racing" -> {
-                headerStatus.text = "Racing 4 agents in parallel…"
+                subtitle.text = "Racing 4 agents in parallel…"
             }
             "completed" -> {
-                headerStatus.text = "Winner found."
+                subtitle.text = "Race complete · winner found."
                 status.winner?.let {
+                    winnerAgentName = it.agent
                     winnerPanel.show(it, status.leaderboard_row)
                 }
                 banner.text = " "
+                // Trigger re-render with winner highlight.
+                agentTable.repaint()
+                refreshDetailsPane()
             }
             "no_winner" -> {
-                headerStatus.text = "No agent survived both gates."
-                banner.text = "All four models failed the RED or GREEN gate. Open their rows above for details."
+                subtitle.text = "Race complete · no winner."
+                banner.text = "All four models failed their gates. Click a row for details."
                 banner.foreground = JBColor.ORANGE
             }
         }
     }
 
     fun showError(msg: String) {
-        headerStatus.text = "Something broke."
+        subtitle.text = "Something broke."
         banner.text = msg
         banner.foreground = JBColor.RED
     }
@@ -168,15 +222,14 @@ class RedGreenToolWindow(private val project: Project) {
 
     private fun appendOrUpdateAgent(a: AgentResult) {
         val existing = (0 until agentTableModel.rowCount).firstOrNull {
-            agentTableModel.getValueAt(it, 0) == a.agent
+            val cell = agentTableModel.getValueAt(it, 0) as? String ?: return@firstOrNull false
+            // We display the humanized name but key on the raw agent id via suffix.
+            cell.startsWith(humanAgentName(a.agent).substringBefore(" "))
         }
-        val row = arrayOf<Any>(
-            a.agent,
-            a.model,
-            humanStatus(a.status),
-            "${a.elapsed_ms} ms".let { if (a.elapsed_ms == 0) "—" else it },
-            a.eliminated_reason?.take(120) ?: "",
-        )
+        val phaseText = phaseLabel(a)
+        val timeText = humanizeMs(a.elapsed_ms)
+        val note = a.eliminated_reason?.let { truncateOneLine(it, 200) } ?: ""
+        val row = arrayOf<Any>(humanAgentName(a.agent), a.model, phaseText, timeText, note)
         if (existing != null) {
             for (c in row.indices) agentTableModel.setValueAt(row[c], existing, c)
         } else {
@@ -188,40 +241,131 @@ class RedGreenToolWindow(private val project: Project) {
         while (agentTableModel.rowCount > 0) agentTableModel.removeRow(0)
     }
 
-    private fun humanStatus(s: String): String = when (s) {
-        "pending" -> "waiting"
-        "red_ok" -> "RED ✓"
-        "red_failed" -> "RED ✗"
-        "green_ok" -> "GREEN ✓"
-        "green_failed" -> "GREEN ✗"
-        "error" -> "error"
-        else -> s
+    /** Phase label combines status + elapsed_ms to give richer live feedback. */
+    private fun phaseLabel(a: AgentResult): String = when {
+        a.status == "pending" && a.elapsed_ms == 0 -> "waiting for model…"
+        a.status == "pending" && a.elapsed_ms > 0 -> "model done · running RED gate"
+        a.status == "red_ok" -> "RED ✓ · running GREEN gate"
+        a.status == "red_failed" -> "RED ✗ failed"
+        a.status == "green_ok" -> if (a.agent == winnerAgentName) "🏆 WINNER · GREEN ✓" else "GREEN ✓ passed"
+        a.status == "green_failed" -> "GREEN ✗ failed"
+        a.status == "error" -> "model error"
+        else -> a.status
+    }
+
+    private fun refreshDetailsPane() {
+        val row = agentTable.selectedRow
+        if (row < 0) {
+            detailHeader.text = "Select an agent to see details."
+            detailBody.text = ""
+            return
+        }
+        val displayName = agentTableModel.getValueAt(row, 0) as? String ?: return
+        val rawAgent = displayName.substringBefore(" ").lowercase()
+        // Try exact match first; fall back to substring.
+        val match = lastStatus?.agents?.firstOrNull { it.agent == rawAgent }
+            ?: lastStatus?.agents?.firstOrNull { displayName.startsWith(humanAgentName(it.agent).substringBefore(" ")) }
+
+        if (match == null) {
+            detailHeader.text = "No data for that row yet."
+            detailBody.text = ""
+            return
+        }
+
+        detailHeader.text = "${humanAgentName(match.agent)} — ${match.model} — ${phaseLabel(match)}"
+        val reason = match.eliminated_reason ?: "(no elimination reason — agent is still racing or won)"
+        detailBody.text = reason
+        detailBody.caretPosition = 0
     }
 
     private fun wrap(c: Component) = JBPanel<JBPanel<*>>(BorderLayout()).apply {
         isOpaque = false
         add(c, BorderLayout.WEST)
     }
+
+    companion object {
+        /** Matches backend/providers/__init__.py defaults; used to seed placeholder rows. */
+        val DEFAULT_POOL = listOf(
+            "null_guard" to "gpt-5-mini",
+            "input_shape" to "meta-llama/Llama-3.3-70B-Instruct",
+            "async_race" to "Qwen/Qwen3-32B",
+            "config_drift" to "deepseek-ai/DeepSeek-V3.2-fast",
+        )
+
+        fun humanAgentName(agent: String): String = when (agent) {
+            "null_guard" -> "null_guard · 'what's None?'"
+            "input_shape" -> "input_shape · 'wrong shape?'"
+            "async_race" -> "async_race · 'bad ordering?'"
+            "config_drift" -> "config_drift · 'wrong config?'"
+            else -> agent
+        }
+
+        fun humanizeMs(ms: Int): String = when {
+            ms <= 0 -> "—"
+            ms < 1_000 -> "${ms}ms"
+            ms < 60_000 -> "%.1fs".format(ms / 1000.0)
+            else -> "${ms / 60_000}m${(ms % 60_000) / 1000}s"
+        }
+
+        fun truncateOneLine(s: String, max: Int): String {
+            val oneLine = s.replace('\n', ' ').trim()
+            return if (oneLine.length <= max) oneLine else oneLine.take(max - 1) + "…"
+        }
+    }
 }
 
 
 /**
- * Custom renderer that colors GREEN/RED status text in the agent table.
- * Singleton — we don't need per-table state.
+ * Renderer for the "Phase" column: colors based on the full phase label text.
  */
-private object StatusCellRenderer : DefaultTableCellRenderer() {
+private class StatusCellRenderer(
+    private val winnerAgent: () -> String?,
+) : DefaultTableCellRenderer() {
     override fun getTableCellRendererComponent(
         table: JTable?, value: Any?, isSelected: Boolean, hasFocus: Boolean,
         row: Int, column: Int,
     ): Component {
         val c = super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column)
-        if (column == 2 && value is String) {
-            when {
-                value.contains("GREEN ✓") -> foreground = JBColor(0x3FB950, 0x3FB950)
-                value.contains("RED ✓") -> foreground = JBColor(0xCF8A4B, 0xCF8A4B)
-                value.contains("✗") || value == "error" -> foreground = JBColor(0xE04B4B, 0xE04B4B)
-                else -> foreground = JBColor.GRAY
+        if (value is String) {
+            foreground = when {
+                value.startsWith("🏆") -> JBColor(0xB88800, 0xE0B84B)
+                value.startsWith("GREEN ✓") -> JBColor(0x3FB950, 0x3FB950)
+                value.startsWith("RED ✓") -> JBColor(0xCF8A4B, 0xE0A05A)
+                value.contains("✗") || value == "model error" -> JBColor(0xE04B4B, 0xE04B4B)
+                value.startsWith("waiting") || value.startsWith("queued") -> JBColor.GRAY
+                else -> JBColor.foreground()
             }
+            font = if (value.startsWith("🏆")) JBFont.label().asBold() else JBFont.label()
+        }
+        return c
+    }
+}
+
+
+/**
+ * Row-level background/bold for the winning row.
+ */
+private class WinnerRowRenderer(
+    private val winnerAgent: () -> String?,
+) : DefaultTableCellRenderer() {
+    override fun getTableCellRendererComponent(
+        table: JTable?, value: Any?, isSelected: Boolean, hasFocus: Boolean,
+        row: Int, column: Int,
+    ): Component {
+        val c = super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column)
+        val winner = winnerAgent()
+        val isWinnerRow = winner != null && table != null &&
+            (table.model.getValueAt(row, 0) as? String)?.startsWith(
+                RedGreenToolWindow.humanAgentName(winner).substringBefore(" ")
+            ) == true
+        if (isWinnerRow && !isSelected) {
+            background = JBColor(0x1F3D2E, 0x1F3D2E)
+            foreground = JBColor(0x7ED98F, 0x7ED98F)
+            font = JBFont.label().asBold()
+        } else if (!isSelected) {
+            background = table?.background
+            foreground = JBColor.foreground()
+            font = JBFont.label()
         }
         return c
     }

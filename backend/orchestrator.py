@@ -164,6 +164,14 @@ async def _race_one_agent(spec: AgentSpec, request: AnalyzeRequest, episode_id: 
         )
         return outcome
 
+    # Live update: model returned a valid candidate. Still "pending" until the
+    # runner gates pass, but with elapsed_ms > 0 the plugin can show "model done".
+    supa.upsert_agent(
+        episode_id=episode_id, agent=spec.name, model=spec.model,
+        status="pending", elapsed_ms=gen_ms,
+        test_code=gen["test_code"], patch_unified_diff=gen["patch"], rationale=gen["rationale"],
+    )
+
     # RED gate.
     snap_red = _prepare_snapshot(pathlib.Path(request.repo_snapshot_path))
     try:
@@ -186,6 +194,13 @@ async def _race_one_agent(spec: AgentSpec, request: AnalyzeRequest, episode_id: 
             test_code=outcome.test_code, patch_unified_diff=outcome.patch, rationale=outcome.rationale,
         )
         return outcome
+
+    # Live update: RED gate passed. Plugin shows "RED ✓ running GREEN".
+    supa.upsert_agent(
+        episode_id=episode_id, agent=spec.name, model=spec.model,
+        status="red_ok", elapsed_ms=gen_ms + red.duration_ms,
+        test_code=gen["test_code"], patch_unified_diff=gen["patch"], rationale=gen["rationale"],
+    )
 
     # GREEN gate.
     snap_green = _prepare_snapshot(pathlib.Path(request.repo_snapshot_path))

@@ -1,0 +1,129 @@
+# RedGreen — Claude Working Agreement
+
+## Mission
+
+RedGreen is a JetBrains plugin that, when the debugger trips an exception, races 4 different models in parallel. Each returns `(failing test, patch, rationale)`. A Docker pytest runner is the referee: survivors must reproduce the bug RED, then flip it GREEN. The winning patch surfaces as a gutter suggestion. Every episode is logged to Supabase; a per-codebase leaderboard reweights the agent pool so later episodes pick the right model first.
+
+Built at the JetBrains Codex Hackathon 2026-04-18 / 2026-04-19. Submission due Sunday 12:00 PM.
+
+## Non-goals (locked)
+
+- ❌ Chat UI / "ask the AI about your code" — trigger is the debugger, never a chat box.
+- ❌ Web dashboard where users paste a stacktrace — kills the IDE-native frame.
+- ❌ Mocks for the runner — pytest in Docker or it doesn't ship.
+- ❌ Settings UI, persistent config, login, onboarding.
+- ❌ More than 4 model slots.
+- ❌ Generic multi-file refactor or ticket-to-PR — stay Track 2.
+- ❌ Any code copied from `../redgreen-skeleton/` — hackathon rule 7B.
+
+## The 60-second demo script (this IS the spec)
+
+Every file in this repo earns its place by serving this demo:
+
+1. (0:00) Open PyCharm with `seeds/null_guard/`. RedGreen plugin visible in sidebar.
+2. (0:05) Debug → exception: `TypeError: refund_amount must not be None`.
+3. (0:08) Tool window: "RedGreen racing 4 agents..." — 4 rows stream live.
+4. (0:14) Row-by-row outcomes: 3 eliminated, `null_guard` GREEN in ~8s.
+5. (0:22) Gutter suggestion appears. Preview shows +3/-1.
+6. (0:26) Tab → patch applied, test file created.
+7. (0:30) Cut to Vercel leaderboard: "Episode 7 · null_guard · Codex · 8.2s".
+8. (0:38) Cut back. Second bug. Tool window: "leaderboard predicts: null_guard". Wins first attempt.
+9. (0:50) End card: `github.com/rudranshagrawal/redgreen`.
+
+If a change doesn't serve this demo, it doesn't ship this weekend.
+
+## Three wire contracts (frozen — see `contracts/schemas.py`)
+
+```python
+# Plugin -> Backend
+AnalyzeRequest:  stacktrace, locals_json, frame_file, frame_line,
+                 frame_source, repo_hash, repo_snapshot_path
+AnalyzeResponse: episode_id
+
+# Backend -> Runner (internal)
+RunRequest:  episode_id, agent, test_code,
+             patch_unified_diff (Optional), repo_snapshot_path
+RunResponse: status ("RED"|"GREEN"|"ERROR"), stdout, duration_ms
+
+# Plugin <- Backend (poll)
+StatusResponse: episode_id, state ("racing"|"completed"|"no_winner"),
+                agents [AgentResult], winner (Optional), leaderboard_row (Optional)
+```
+
+Plugin and backend never block on each other — both implement to these schemas.
+
+## Repo map + workstream ownership
+
+- `contracts/` — shared. Edited once (M0) and then frozen.
+- `backend/` — FastAPI orchestrator. Fan-out to providers, rank survivors, write episode. Plugin-agnostic.
+- `runner/` — Docker pytest sandbox. Stateless. Runs RED gate then GREEN gate.
+- `plugin/` — Kotlin JetBrains plugin. XDebugSessionListener → HTTP → tool window → gutter.
+- `web/` — Next.js leaderboard on Vercel. Read-only view on Supabase.
+- `seeds/{null_guard,input_shape,async_race,config_drift}/` — one buggy repo per hypothesis type. Each must RED→GREEN reliably under `just test-seed <name>`.
+- `supabase/schema.sql` — `episodes`, `agents` rows, `leaderboard` view.
+- `scripts/` — dev, demo, seed runners.
+
+Plugin code and backend code only meet at `contracts/`. Never import across the boundary.
+
+## Dev commands (justfile)
+
+- `just check` — env loaded, Supabase + Codex + Nebius reachable.
+- `just dev` — backend + runner image + web dev server.
+- `just seed <name>` — one episode end-to-end from CLI (no plugin).
+- `just seed-all` — verify all 4 seeds RED→GREEN.
+- `just test-seed <name>` — single-seed smoke test in the runner.
+- `just demo` — scripted 60-second demo sequence headless.
+- `just runner-build` — build the Docker runner image.
+- `just plugin-run` — `gradle runIde` sandbox.
+- `just web-deploy` — `vercel --prod` from `web/`.
+
+## Sponsor integration points
+
+| Sponsor | Role | Status |
+|---------|------|--------|
+| Codex (OpenAI) | Model slot 1 (GPT-5 Codex) | load-bearing |
+| Nebius Token Factory | Model slots 2–4 | load-bearing |
+| Supabase | episodes + leaderboard storage | load-bearing |
+| Docker | referee (pytest sandbox) | load-bearing |
+| Vercel | leaderboard web host | load-bearing |
+| AuthZed | PR authorization check | stretch (M6) |
+| BKey | Face ID approval on deny | stretch (M6) |
+| Clerk | — | cut (no auth in demo) |
+
+## Hard rules
+
+1. **No mocks for the runner.** Ever. Fake green checkmarks in the demo are disqualifying.
+2. **No code reused from `../redgreen-skeleton/`.** That repo is design reference only. Commit history starting 2026-04-18 is our compliance proof.
+3. **One component per edit loop.** Finish backend happy path before touching plugin. Finish plugin before polishing web.
+4. **Trace-before-fix.** Read the stacktrace and the referee output before editing anything.
+5. **No destructive git** (`rm -rf`, `--force`, `reset --hard`) without explicit user approval.
+6. **Every new bug type needs a seed repo that RED→GREENs reliably** under `just test-seed`.
+7. **Freeze contracts at M0.** If a schema change is truly needed, bump a version and update both sides in one commit.
+8. **Do not start the dev server / runner / plugin sandbox unless asked.** Long-running processes should be intentional.
+
+## Fallback decision tree (M3 kill-switch)
+
+Hour 8 (Saturday 11 PM) gate: if the JetBrains plugin does not have the debugger exception listener firing end-to-end and POSTing to the backend, pivot.
+
+**Pivot target:** MCP server (reuse patterns from `../trana-sprint-board/mcp/server.ts`). Exposes `analyze_exception` as an MCP tool. Demo recorded in Cursor / Claude Desktop instead of PyCharm.
+
+**What survives the pivot:** everything in `backend/`, `runner/`, `web/`, `seeds/`, `supabase/`, `contracts/`. Only `plugin/` is discarded. Cost ≈ 30 minutes.
+
+**What gets cut if we pivot:** the "IDE Reimagined" framing slides slightly — we still have the IDE-surface story because MCP lives inside the editor, but the gutter-suggestion Tab-to-apply demo beat becomes a tool-call response instead.
+
+## Milestones (21 hours from 2026-04-18 15:00)
+
+- M0 (h0–1): repo init + contracts frozen.
+- M1 (h1–3): backend happy path, 1 model, 1 seed.
+- M2 (h3–5): fan-out to 4 models, all seeds reproduce.
+- M3 (h5–8): plugin end-to-end **← kill-switch at h8**.
+- M4 (h8–10): leaderboard + reweighting + Vercel deploy.
+- M5 (h10–12): polish round 1, seeds reliable.
+- M6 (h12–15): AuthZed + BKey (stretch, only if M0–M5 green).
+- M7 (h15–18): record demo video.
+- M8 (h18–20): submission + pitch.
+- M9 (h20–21): buffer / Q&A rehearsal.
+
+## A note for Claude
+
+Keep updates short. Before each milestone, re-read this file's non-goals. If I ask for something that violates a non-goal, push back first.

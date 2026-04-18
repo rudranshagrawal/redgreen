@@ -46,7 +46,7 @@ async def generate(
     system: str,
     user: str,
     model: str,
-    max_tokens: int = 4000,
+    max_tokens: int = 6000,
     timeout_s: float = 60.0,
 ) -> dict:
     client = _get_client()

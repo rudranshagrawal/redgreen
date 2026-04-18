@@ -1,7 +1,9 @@
-"""The orchestrator: takes an AnalyzeRequest, runs agents, refs with the runner.
+"""The orchestrator.
 
-M1 scope: one agent (null_guard / Codex). M2 will fan this out to 4 agents in
-parallel and rank survivors by files_touched.
+M2: race 4 agents in parallel. Survivors are the ones that pass both the RED
+gate (their test reproduces the bug) and the GREEN gate (their patch flips
+it). Winner is the survivor with the fewest files touched, elapsed_ms as
+tiebreak.
 
 Every decision here is constrained by CLAUDE.md hard rules. In particular:
 - No mocks. The runner is real pytest-in-Docker.
@@ -22,8 +24,8 @@ import sys
 import tempfile
 import time
 import traceback
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Callable, Optional
 
 from dotenv import load_dotenv
 
@@ -33,7 +35,11 @@ load_dotenv(_REPO_ROOT / ".env.local", override=False)
 
 from backend import hypotheses, supa  # noqa: E402
 from backend.providers import (  # noqa: E402
+    DEFAULT_NEBIUS_DEEPSEEK,
+    DEFAULT_NEBIUS_LLAMA,
+    DEFAULT_NEBIUS_QWEN,
     DEFAULT_OPENAI_MODEL,
+    nebius_generate,
     openai_codex_generate,
 )
 from contracts.schemas import AnalyzeRequest  # noqa: E402
@@ -51,10 +57,10 @@ class RunnerResult:
     duration_ms: int
 
 
-def run_in_docker(*, episode_id: str, agent: str, test_code: str, patch: Optional[str], repo_snapshot_path: str) -> RunnerResult:
+def _run_in_docker_sync(*, test_code: str, patch: Optional[str], repo_snapshot_path: str) -> RunnerResult:
     payload = {
-        "episode_id": episode_id,
-        "agent": agent,
+        "episode_id": "n/a",
+        "agent": "n/a",
         "test_code": test_code,
         "patch_unified_diff": patch,
         "repo_snapshot_path": "/work",
@@ -75,38 +81,64 @@ def run_in_docker(*, episode_id: str, agent: str, test_code: str, patch: Optiona
     return RunnerResult(status=obj["status"], stdout=obj.get("stdout", ""), duration_ms=int(obj.get("duration_ms", 0)))
 
 
+async def run_in_docker(**kwargs) -> RunnerResult:
+    """Non-blocking wrapper so many runners can race in parallel."""
+    return await asyncio.to_thread(_run_in_docker_sync, **kwargs)
+
+
 def _prepare_snapshot(repo_path: pathlib.Path) -> pathlib.Path:
-    """Copy the repo snapshot into a writable temp dir so the runner can patch it."""
     snap = pathlib.Path(tempfile.mkdtemp(prefix="redgreen-snap-"))
     shutil.copytree(repo_path, snap, dirs_exist_ok=True)
     return snap
 
 
-# -------- 4-phase failure capture (CLAUDE.md hard rule #9 / ECC pattern) --------
+# -------- agent specs --------
 
-def _log_header(msg: str) -> None:
-    print(f"\n=== {msg} ===", flush=True)
+AgentName = str  # null_guard | input_shape | async_race | config_drift
+ProviderFn = Callable[..., "asyncio.Future[dict]"]
 
 
-# -------- episode runner (M1: one agent) --------
+@dataclass(frozen=True)
+class AgentSpec:
+    name: AgentName
+    model: str
+    provider: ProviderFn  # async def generate(*, system, user, model, max_tokens) -> dict
 
-async def run_episode(request: AnalyzeRequest, *, agent: str = "null_guard", model: Optional[str] = None) -> dict:
-    model = model or DEFAULT_OPENAI_MODEL
 
-    episode_id = supa.insert_episode(
-        repo_hash=request.repo_hash,
-        frame_file=request.frame_file,
-        frame_line=request.frame_line,
-        stacktrace=request.stacktrace,
-        notes=f"agent={agent} model={model}",
-    )
-    supa.upsert_agent(episode_id=episode_id, agent=agent, model=model, status="pending")
+def default_agent_pool() -> list[AgentSpec]:
+    return [
+        AgentSpec("null_guard", DEFAULT_OPENAI_MODEL, openai_codex_generate),
+        AgentSpec("input_shape", DEFAULT_NEBIUS_LLAMA, nebius_generate),
+        AgentSpec("async_race", DEFAULT_NEBIUS_QWEN, nebius_generate),
+        AgentSpec("config_drift", DEFAULT_NEBIUS_DEEPSEEK, nebius_generate),
+    ]
 
-    started = time.monotonic()
-    _log_header(f"episode {episode_id} — {agent} / {model}")
 
-    gen = await openai_codex_generate(
-        system=hypotheses.system_prompt(agent),
+# -------- per-agent outcome --------
+
+@dataclass
+class AgentOutcome:
+    spec: AgentSpec
+    status: str  # pending | red_ok | red_failed | green_ok | green_failed | error
+    elapsed_ms: int = 0
+    files_touched: int = 0
+    eliminated_reason: Optional[str] = None
+    test_code: str = ""
+    patch: str = ""
+    rationale: str = ""
+    gen_ms: int = 0
+    red_ms: int = 0
+    green_ms: int = 0
+
+
+# -------- single-agent race --------
+
+async def _race_one_agent(spec: AgentSpec, request: AnalyzeRequest, episode_id: str) -> AgentOutcome:
+    tag = f"{spec.name:<13}"
+    print(f"  {tag} start    model={spec.model}", flush=True)
+
+    gen = await spec.provider(
+        system=hypotheses.system_prompt(spec.name),
         user=hypotheses.user_prompt(
             stacktrace=request.stacktrace,
             frame_file=request.frame_file,
@@ -114,76 +146,169 @@ async def run_episode(request: AnalyzeRequest, *, agent: str = "null_guard", mod
             frame_source=request.frame_source,
             locals_json=request.locals_json,
         ),
-        model=model,
+        model=spec.model,
     )
-    print(f"  model: {gen.get('elapsed_ms')}ms, in={gen.get('input_tokens')} out={gen.get('output_tokens')} err={gen.get('error')}")
-    if gen.get("error") or not gen["test_code"] or not gen["patch"]:
-        supa.upsert_agent(
-            episode_id=episode_id, agent=agent, model=model,
-            status="error", elapsed_ms=gen.get("elapsed_ms", 0),
+    gen_ms = gen.get("elapsed_ms", 0)
+    print(f"  {tag} model    {gen_ms}ms in={gen.get('input_tokens')} out={gen.get('output_tokens')} err={gen.get('error')}", flush=True)
+
+    if gen.get("error") or not gen.get("test_code") or not gen.get("patch"):
+        outcome = AgentOutcome(
+            spec=spec, status="error", elapsed_ms=gen_ms, gen_ms=gen_ms,
             eliminated_reason=gen.get("error") or "empty test/patch",
             rationale=gen.get("rationale", ""),
         )
-        supa.finalize_episode(episode_id=episode_id, state="no_winner", total_elapsed_ms=int((time.monotonic() - started) * 1000))
-        return {"episode_id": episode_id, "winner": None, "reason": gen.get("error") or "empty test/patch"}
+        supa.upsert_agent(
+            episode_id=episode_id, agent=spec.name, model=spec.model,
+            status=outcome.status, elapsed_ms=outcome.elapsed_ms,
+            eliminated_reason=outcome.eliminated_reason, rationale=outcome.rationale,
+        )
+        return outcome
 
-    # RED gate: fresh snapshot, no patch.
+    # RED gate.
     snap_red = _prepare_snapshot(pathlib.Path(request.repo_snapshot_path))
     try:
-        red = run_in_docker(episode_id=episode_id, agent=agent, test_code=gen["test_code"], patch=None, repo_snapshot_path=str(snap_red))
+        red = await run_in_docker(test_code=gen["test_code"], patch=None, repo_snapshot_path=str(snap_red))
     finally:
         shutil.rmtree(snap_red, ignore_errors=True)
-    print(f"  RED gate: {red.status} ({red.duration_ms}ms)")
-    if red.status != "RED":
-        supa.upsert_agent(
-            episode_id=episode_id, agent=agent, model=model,
-            status="red_failed", elapsed_ms=gen["elapsed_ms"] + red.duration_ms,
-            eliminated_reason=f"RED gate returned {red.status}: {red.stdout[-500:]}",
-            test_code=gen["test_code"], patch_unified_diff=gen["patch"], rationale=gen["rationale"],
-        )
-        supa.finalize_episode(episode_id=episode_id, state="no_winner", total_elapsed_ms=int((time.monotonic() - started) * 1000))
-        return {"episode_id": episode_id, "winner": None, "reason": "red_failed", "stdout": red.stdout}
+    print(f"  {tag} RED      {red.status} ({red.duration_ms}ms)", flush=True)
 
-    # GREEN gate: fresh snapshot, apply patch.
+    if red.status != "RED":
+        outcome = AgentOutcome(
+            spec=spec, status="red_failed", elapsed_ms=gen_ms + red.duration_ms,
+            gen_ms=gen_ms, red_ms=red.duration_ms,
+            eliminated_reason=f"RED -> {red.status}: {red.stdout[-300:]}",
+            test_code=gen["test_code"], patch=gen["patch"], rationale=gen["rationale"],
+        )
+        supa.upsert_agent(
+            episode_id=episode_id, agent=spec.name, model=spec.model,
+            status=outcome.status, elapsed_ms=outcome.elapsed_ms,
+            eliminated_reason=outcome.eliminated_reason,
+            test_code=outcome.test_code, patch_unified_diff=outcome.patch, rationale=outcome.rationale,
+        )
+        return outcome
+
+    # GREEN gate.
     snap_green = _prepare_snapshot(pathlib.Path(request.repo_snapshot_path))
     try:
-        green = run_in_docker(episode_id=episode_id, agent=agent, test_code=gen["test_code"], patch=gen["patch"], repo_snapshot_path=str(snap_green))
+        green = await run_in_docker(test_code=gen["test_code"], patch=gen["patch"], repo_snapshot_path=str(snap_green))
     finally:
         shutil.rmtree(snap_green, ignore_errors=True)
-    print(f"  GREEN gate: {green.status} ({green.duration_ms}ms)")
-    if green.status != "GREEN":
-        supa.upsert_agent(
-            episode_id=episode_id, agent=agent, model=model,
-            status="green_failed", elapsed_ms=gen["elapsed_ms"] + red.duration_ms + green.duration_ms,
-            eliminated_reason=f"GREEN gate returned {green.status}: {green.stdout[-500:]}",
-            test_code=gen["test_code"], patch_unified_diff=gen["patch"], rationale=gen["rationale"],
-        )
-        supa.finalize_episode(episode_id=episode_id, state="no_winner", total_elapsed_ms=int((time.monotonic() - started) * 1000))
-        return {"episode_id": episode_id, "winner": None, "reason": "green_failed", "stdout": green.stdout}
+    print(f"  {tag} GREEN    {green.status} ({green.duration_ms}ms)", flush=True)
 
-    total_elapsed = int((time.monotonic() - started) * 1000)
-    files_touched = gen["patch"].count("\n+++ b/")
-    supa.upsert_agent(
-        episode_id=episode_id, agent=agent, model=model,
-        status="green_ok", elapsed_ms=gen["elapsed_ms"] + red.duration_ms + green.duration_ms,
-        files_touched=files_touched or 1,
-        test_code=gen["test_code"], patch_unified_diff=gen["patch"], rationale=gen["rationale"],
+    elapsed = gen_ms + red.duration_ms + green.duration_ms
+    files_touched = max(1, gen["patch"].count("\n+++ b/"))
+    if green.status != "GREEN":
+        outcome = AgentOutcome(
+            spec=spec, status="green_failed", elapsed_ms=elapsed,
+            gen_ms=gen_ms, red_ms=red.duration_ms, green_ms=green.duration_ms,
+            files_touched=files_touched,
+            eliminated_reason=f"GREEN -> {green.status}: {green.stdout[-300:]}",
+            test_code=gen["test_code"], patch=gen["patch"], rationale=gen["rationale"],
+        )
+        supa.upsert_agent(
+            episode_id=episode_id, agent=spec.name, model=spec.model,
+            status=outcome.status, elapsed_ms=outcome.elapsed_ms,
+            files_touched=outcome.files_touched,
+            eliminated_reason=outcome.eliminated_reason,
+            test_code=outcome.test_code, patch_unified_diff=outcome.patch, rationale=outcome.rationale,
+        )
+        return outcome
+
+    outcome = AgentOutcome(
+        spec=spec, status="green_ok", elapsed_ms=elapsed,
+        gen_ms=gen_ms, red_ms=red.duration_ms, green_ms=green.duration_ms,
+        files_touched=files_touched,
+        test_code=gen["test_code"], patch=gen["patch"], rationale=gen["rationale"],
     )
+    supa.upsert_agent(
+        episode_id=episode_id, agent=spec.name, model=spec.model,
+        status=outcome.status, elapsed_ms=outcome.elapsed_ms,
+        files_touched=outcome.files_touched,
+        test_code=outcome.test_code, patch_unified_diff=outcome.patch, rationale=outcome.rationale,
+    )
+    return outcome
+
+
+# -------- race all agents --------
+
+def _rank_survivors(outcomes: list[AgentOutcome]) -> Optional[AgentOutcome]:
+    survivors = [o for o in outcomes if o.status == "green_ok"]
+    if not survivors:
+        return None
+    # Rank: fewest files touched, then fastest, then stable by spec order.
+    survivors.sort(key=lambda o: (o.files_touched, o.elapsed_ms))
+    return survivors[0]
+
+
+async def run_episode(
+    request: AnalyzeRequest,
+    *,
+    pool: Optional[list[AgentSpec]] = None,
+) -> dict:
+    specs = pool or default_agent_pool()
+
+    episode_id = supa.insert_episode(
+        repo_hash=request.repo_hash,
+        frame_file=request.frame_file,
+        frame_line=request.frame_line,
+        stacktrace=request.stacktrace,
+        notes="agents=" + ",".join(s.name for s in specs),
+    )
+    for s in specs:
+        supa.upsert_agent(episode_id=episode_id, agent=s.name, model=s.model, status="pending")
+
+    started = time.monotonic()
+    print(f"\n=== episode {episode_id} — racing {len(specs)} agents ===", flush=True)
+
+    outcomes = await asyncio.gather(*[_race_one_agent(s, request, episode_id) for s in specs])
+
+    winner = _rank_survivors(outcomes)
+    total_elapsed = int((time.monotonic() - started) * 1000)
+
+    if winner is None:
+        supa.finalize_episode(episode_id=episode_id, state="no_winner", total_elapsed_ms=total_elapsed)
+        print(f"\nno winner. total_ms={total_elapsed}", flush=True)
+        return {
+            "episode_id": episode_id, "winner": None, "outcomes": _serialize(outcomes),
+            "total_elapsed_ms": total_elapsed,
+        }
+
     supa.finalize_episode(
         episode_id=episode_id, state="completed",
-        winner_agent=agent, winner_model=model, total_elapsed_ms=total_elapsed,
+        winner_agent=winner.spec.name, winner_model=winner.spec.model,
+        total_elapsed_ms=total_elapsed,
     )
-    print(f"\nRED ✓ GREEN ✓ episode_id={episode_id} total_ms={total_elapsed}")
+    print(
+        f"\nwinner: {winner.spec.name} / {winner.spec.model} "
+        f"(files={winner.files_touched}, elapsed={winner.elapsed_ms}ms) "
+        f"total_ms={total_elapsed}",
+        flush=True,
+    )
     return {
         "episode_id": episode_id,
-        "winner": {"agent": agent, "model": model, "files_touched": files_touched or 1, "total_elapsed_ms": total_elapsed},
+        "winner": {
+            "agent": winner.spec.name, "model": winner.spec.model,
+            "files_touched": winner.files_touched, "total_elapsed_ms": winner.elapsed_ms,
+        },
+        "outcomes": _serialize(outcomes),
+        "total_elapsed_ms": total_elapsed,
     }
+
+
+def _serialize(outcomes: list[AgentOutcome]) -> list[dict]:
+    return [
+        {
+            "agent": o.spec.name, "model": o.spec.model, "status": o.status,
+            "elapsed_ms": o.elapsed_ms, "files_touched": o.files_touched,
+            "eliminated_reason": o.eliminated_reason,
+        }
+        for o in outcomes
+    ]
 
 
 # -------- CLI entry --------
 
 def _load_seed_as_request(seed_name: str) -> AnalyzeRequest:
-    """Build an AnalyzeRequest from a seed directory by running its crash.py."""
     seed_root = _REPO_ROOT / "seeds" / seed_name
     if not seed_root.exists():
         raise SystemExit(f"seed not found: {seed_root}")
@@ -197,7 +322,6 @@ def _load_seed_as_request(seed_name: str) -> AnalyzeRequest:
         raise SystemExit(f"{crash_script} exited 0 — seed is not reproducing its bug.")
     stacktrace = proc.stderr.strip() or proc.stdout.strip()
 
-    # Pull frame_file + frame_line from the last `File "X", line N` in the trace.
     import re
     matches = re.findall(r'File "([^"]+)", line (\d+)', stacktrace)
     if not matches:
@@ -206,7 +330,6 @@ def _load_seed_as_request(seed_name: str) -> AnalyzeRequest:
     frame_file = os.path.relpath(frame_file_abs, seed_root) if frame_file_abs.startswith(str(seed_root)) else frame_file_abs
     frame_line = int(frame_line_str)
 
-    # Grab ~40 lines around the failing line for context.
     src_path = pathlib.Path(frame_file_abs)
     src_lines = src_path.read_text().splitlines()
     lo = max(0, frame_line - 20)
@@ -217,7 +340,7 @@ def _load_seed_as_request(seed_name: str) -> AnalyzeRequest:
 
     return AnalyzeRequest(
         stacktrace=stacktrace,
-        locals_json={},  # M1: skip real locals capture; M3 plugin side will fill.
+        locals_json={},
         frame_file=frame_file,
         frame_line=frame_line,
         frame_source=frame_source,
@@ -238,10 +361,9 @@ def _git_sha(path: pathlib.Path) -> str:
 
 def _main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--seed", required=True, help="seed name under seeds/ (e.g., null_guard)")
-    ap.add_argument("--cli", action="store_true", help="run one episode from the CLI (no FastAPI)")
-    ap.add_argument("--agent", default="null_guard")
-    ap.add_argument("--model", default=None)
+    ap.add_argument("--seed", required=True)
+    ap.add_argument("--cli", action="store_true")
+    ap.add_argument("--solo", default=None, help="race only one agent by name (for debugging)")
     args = ap.parse_args()
 
     try:
@@ -250,15 +372,22 @@ def _main() -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
 
+    pool = default_agent_pool()
+    if args.solo:
+        pool = [s for s in pool if s.name == args.solo]
+        if not pool:
+            print(f"ERROR: no agent named {args.solo}", file=sys.stderr)
+            return 2
+
     try:
-        result = asyncio.run(run_episode(req, agent=args.agent, model=args.model))
+        result = asyncio.run(run_episode(req, pool=pool))
     except Exception:
         traceback.print_exc()
         return 1
 
     if result.get("winner"):
         return 0
-    print(f"no winner: {result.get('reason')}", file=sys.stderr)
+    print(f"no winner. reasons: " + "; ".join(f"{o['agent']}={o['status']}" for o in result["outcomes"]), file=sys.stderr)
     return 3
 
 

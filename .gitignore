@@ -21,6 +21,7 @@ build/
 .gradle/
 .idea/
 *.iml
+.intellijPlatform/
 
 # Env / secrets
 .env

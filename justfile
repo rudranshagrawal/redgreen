@@ -56,5 +56,14 @@ web-deploy:
     cd web && vercel --prod --yes
 
 # Launch a PyCharm sandbox with the RedGreen plugin loaded.
+# Needs JDK 21 (brew install openjdk@21) and Gradle already resolved once (first run downloads PyCharm).
 plugin-run:
-    cd plugin && ./gradlew runIde
+    cd plugin && JAVA_HOME="/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home" PATH="/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home/bin:$PATH" ./gradlew runIde
+
+# Build the plugin distribution zip (plugin/build/distributions/redgreen-*.zip).
+plugin-build:
+    cd plugin && JAVA_HOME="/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home" PATH="/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home/bin:$PATH" ./gradlew --no-daemon buildPlugin
+
+# Run the FastAPI backend (needed by the plugin).
+backend-run:
+    {{PY}} -m uvicorn backend.main:app --host 127.0.0.1 --port 8787 --reload

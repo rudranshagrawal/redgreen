@@ -1,0 +1,44 @@
+<idea-plugin>
+    <id>com.redgreen</id>
+    <name>RedGreen</name>
+    <vendor email="rudranshagrawal10@gmail.com" url="https://github.com/rudranshagrawal/redgreen">
+        Rudransh Agrawal
+    </vendor>
+
+    <description><![CDATA[
+        <h2>RedGreen — the IDE catches its own bugs and learns which model to trust.</h2>
+
+        When the debugger trips an exception, RedGreen races four different models in parallel.
+        Each returns a failing test + patch. A Docker pytest runner referees: RED (bug reproduces)
+        then GREEN (patch flips it). Winner surfaces as a gutter suggestion; Tab applies.
+
+        Every episode logs to a per-codebase leaderboard so later episodes pick the right
+        model first try.
+
+        Built at the JetBrains Codex Hackathon 2026.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>PythonCore</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow
+            id="RedGreen"
+            anchor="right"
+            icon="/icons/redgreen.svg"
+            factoryClass="com.redgreen.RedGreenToolWindowFactory"/>
+        <applicationService serviceImplementation="com.redgreen.RedGreenSettings"/>
+        <projectService serviceImplementation="com.redgreen.RedGreenService"/>
+        <postStartupActivity implementation="com.redgreen.StartupActivity"/>
+    </extensions>
+
+    <actions>
+        <action id="RedGreen.AnalyzeExceptionAction"
+                class="com.redgreen.actions.AnalyzeExceptionAction"
+                text="RedGreen: Analyze Exception"
+                description="Send the current file + a fake exception to the RedGreen backend">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+            <keyboard-shortcut keymap="$default" first-keystroke="control alt R"/>
+        </action>
+    </actions>
+</idea-plugin>

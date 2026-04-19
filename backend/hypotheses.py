@@ -28,12 +28,34 @@ Return a single JSON object with exactly these keys:
   - "test_code": string. A complete pytest test module that fails on the
     current buggy code and passes after `patch` is applied. Import the
     function(s) under test from the repo's package — do not inline the
-    implementation. Do not use `pytest.raises` as the sole assertion.
+    implementation. Write DOMAIN-level assertions: what the function
+    SHOULD return for valid inputs, and that invalid inputs surface a
+    clear error. Avoid tests that just restate current accidental
+    behavior (e.g. "returns 10" when 10 isn't semantically justified).
   - "patch": string. A unified diff starting with `--- a/<path>` and
     `+++ b/<path>`, paths relative to the repo root. One file only.
     Keep the change minimal — ideally 1-5 lines.
+
+    FORBIDDEN "fixes" — these are hacks that silence the crash without
+    addressing the bug, and will be cross-validated out:
+      * Changing a literal value in the source (0 -> 1, "" -> "default",
+        None -> [], False -> True) to dodge the error path.
+      * Renaming a variable to avoid a shadowed name.
+      * Swallowing the exception with a bare try/except.
+      * Lowering the recursion limit instead of adding a base case.
+      * Removing tests or assertions to make the code path stop firing.
+
+    REQUIRED fix pattern (pick the smallest that fits):
+      * Add a guard clause that handles the bad-input case explicitly.
+      * Raise a domain exception (prefer existing project exception
+        classes — see "CODEBASE CONVENTIONS" block if present).
+      * Coerce or validate at the boundary before the failing operation.
+      * Fix the actual typo / signature drift / missing await / wrong
+        default that caused the failure.
+
   - "rationale": string. One paragraph. Plain English. Why this is the bug,
-    under the hypothesis lens you were given.
+    under the hypothesis lens you were given, and WHY your fix is
+    idiomatic (not just "makes it stop crashing").
 
 Respond with ONLY the JSON object. No prose, no code fences, no markdown.
 """
@@ -43,9 +65,13 @@ Respond with ONLY the JSON object. No prose, no code fences, no markdown.
 
 NULL_GUARD = f"""\
 You are the `null_guard` agent. Lens: something that can legitimately be
-None/empty/unset is being used as if it's always present. Fix: smallest
-guard clause — early return, default value, or raise a domain error.
-Don't rewrite the function.
+None/empty/unset is being used as if it's always present.
+
+Fix: smallest guard clause — early return, default value, or raise a
+domain error (prefer project's existing exception types if any).
+
+Don't rewrite the function. Don't change an existing default to dodge
+the None case.
 {_OUTPUT_CONTRACT}
 """
 
@@ -79,9 +105,27 @@ back sensibly, or surface the miss with a clear error.
 MATH_ERROR = f"""\
 You are the `math_error` agent. Lens: arithmetic went wrong — divide by
 zero, numeric overflow, float precision drift, NaN propagation, integer
-truncation. Fix: guard the denominator, switch to Decimal, clamp to a
-sane range, or validate the input bounds. Don't wrap in try/except and
-swallow.
+truncation.
+
+Fix pattern:
+  - Guard the denominator: `if denom == 0: raise ValueError(...)` or
+    return a domain-meaningful default (NOT a made-up magic number).
+  - Switch to Decimal for currency / precision-sensitive math.
+  - Clamp inputs to a valid range before arithmetic.
+  - Validate input bounds at the caller boundary.
+
+ABSOLUTELY NOT ALLOWED:
+  - Changing `denominator = 0` to `denominator = 1` (or any other
+    literal that makes the specific input not-zero). That's not a
+    fix; it silences the crash and produces a meaningless result
+    (e.g. "returns 10" when the input was malformed).
+  - Wrapping in try/except and returning 0 or None without raising.
+
+Write a test that asserts the CORRECT behavior: the function should
+either produce a sensible result for valid inputs, or raise a clear
+error for bad ones. Don't write a test that just asserts the hacky
+return value.
+
 {_OUTPUT_CONTRACT}
 """
 
@@ -265,10 +309,25 @@ the runner treats as ERROR — you lose automatically.
 RULE 3 — NO `pytest.raises` AS THE SOLE ASSERTION. The test must FAIL on
 the current buggy code and PASS after your patch is applied.
 `with pytest.raises(X):` passes on buggy code (the exception IS raised as
-expected) and fails after the fix (no exception) — that's backwards.
-Use `assert actual == expected` instead.
+expected) and fails after the fix (no exception) — that's backwards
+when your patch is supposed to PREVENT the exception.
+
+It IS fine to mix `pytest.raises` with other positive assertions — e.g.
+"valid input returns the right number AND invalid input raises ValueError".
+Just don't make it the only assertion.
 
 If your test file uses any pytest helper, start with `import pytest`.
+
+RULE 4 — NO LITERAL-VALUE HACKS IN THE PATCH. If the bug is
+"denominator = 0 causes division by zero", the fix is NOT to change
+the source line to `denominator = 1`. That's cargo-culting: the crash
+goes away but the function now returns a meaningless answer. Add a
+guard, raise a domain exception, or coerce at the boundary. Cross-
+validation will catch and eliminate literal-swap "fixes" — other
+agents' tests assert real domain behavior.
+
+Acceptable changes: add code (guard, raise, coerce). Unacceptable:
+flip a constant in the buggy line to dodge the code path.
 
 Propose a test + patch per the JSON contract.
 """

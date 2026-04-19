@@ -244,6 +244,124 @@ async def _race_one_agent(spec: AgentSpec, request: AnalyzeRequest, episode_id: 
     return outcome
 
 
+# -------- syntax error fast-path --------
+
+_SYNTAX_FIX_SYSTEM = """\
+You are RedGreen's syntax-error fast-path. PyCharm's parser caught a
+SyntaxError before any code ran; your job is the minimal patch that lets
+the module parse.
+
+Return a JSON object with exactly these keys:
+  - "patch": string. Unified diff `--- a/<path>` / `+++ b/<path>` / `@@`
+    hunks with ~2-3 lines of context. ONE file, one hunk, ideally 1-3
+    changed lines. Anchor on exact source lines from the frame_source.
+  - "rationale": string. One sentence. What the error was.
+
+Do NOT return a test; this path doesn't need one — if the file parses, the
+fix worked. Do NOT rewrite more than is necessary. Just fix the syntax.
+Respond with ONLY the JSON object. No prose, no code fences, no markdown.
+"""
+
+
+async def _run_syntax_fast_path(request: AnalyzeRequest) -> dict:
+    started = time.monotonic()
+    episode_id = supa.insert_episode(
+        repo_hash=request.repo_hash,
+        frame_file=request.frame_file,
+        frame_line=request.frame_line,
+        stacktrace=request.stacktrace,
+        notes="fast-path=syntax",
+    )
+    agent_name = "null_guard"  # reuse existing enum slot for storage; UI shows the right phase
+    model_name = DEFAULT_OPENAI_MODEL
+    supa.upsert_agent(
+        episode_id=episode_id, agent=agent_name, model=model_name, status="pending",
+    )
+
+    user = f"""\
+SyntaxError at {request.frame_file}:{request.frame_line}.
+
+--- stacktrace ---
+{request.stacktrace.strip()}
+
+--- source around the bad line (line numbers are absolute) ---
+{request.frame_source}
+
+Produce the minimal patch.
+"""
+
+    print(f"\n=== episode {episode_id} — SYNTAX fast-path ({model_name}) ===", flush=True)
+    gen = await openai_codex_generate(
+        system=_SYNTAX_FIX_SYSTEM, user=user, model=model_name, max_tokens=1500,
+    )
+    gen_ms = gen.get("elapsed_ms", 0)
+    print(f"  model: {gen_ms}ms err={gen.get('error')}", flush=True)
+
+    patch = (gen.get("patch") or "").strip()
+    rationale = gen.get("rationale") or ""
+
+    # No Docker. We trust the model + the user clicking Apply. If the patch is
+    # wrong, the IDE's own parser will immediately re-flag it.
+    total_elapsed = int((time.monotonic() - started) * 1000)
+
+    if gen.get("error") or not patch:
+        supa.upsert_agent(
+            episode_id=episode_id, agent=agent_name, model=model_name,
+            status="error", elapsed_ms=gen_ms,
+            eliminated_reason=gen.get("error") or "empty patch",
+            rationale=rationale,
+        )
+        supa.finalize_episode(episode_id=episode_id, state="no_winner", total_elapsed_ms=total_elapsed)
+        return {
+            "episode_id": episode_id, "winner": None,
+            "outcomes": [{
+                "agent": agent_name, "model": model_name, "status": "error",
+                "elapsed_ms": gen_ms, "files_touched": 0,
+                "eliminated_reason": gen.get("error") or "empty patch",
+            }],
+            "total_elapsed_ms": total_elapsed,
+        }
+
+    # Synthesize a trivial importlib test so the UI's Apply button's
+    # "generated test" sidecar file still makes sense. It'll just assert
+    # the module imports post-fix.
+    module_stem = request.frame_file.rsplit("/", 1)[-1].removesuffix(".py")
+    synthesized_test = f"""\
+import importlib
+
+
+def test_{module_stem}_parses():
+    importlib.import_module("{module_stem}")
+"""
+
+    supa.upsert_agent(
+        episode_id=episode_id, agent=agent_name, model=model_name,
+        status="green_ok", elapsed_ms=gen_ms,
+        files_touched=1,
+        test_code=synthesized_test,
+        patch_unified_diff=patch,
+        rationale=rationale or "Minimal syntax fix (fast-path — no 4-agent race).",
+    )
+    supa.finalize_episode(
+        episode_id=episode_id, state="completed",
+        winner_agent=agent_name, winner_model=model_name,
+        total_elapsed_ms=total_elapsed,
+    )
+    print(f"\nSYNTAX fast-path winner: {model_name} total_ms={total_elapsed}", flush=True)
+    return {
+        "episode_id": episode_id,
+        "winner": {
+            "agent": agent_name, "model": model_name,
+            "files_touched": 1, "total_elapsed_ms": gen_ms,
+        },
+        "outcomes": [{
+            "agent": agent_name, "model": model_name, "status": "green_ok",
+            "elapsed_ms": gen_ms, "files_touched": 1, "eliminated_reason": None,
+        }],
+        "total_elapsed_ms": total_elapsed,
+    }
+
+
 # -------- race all agents --------
 
 def _rank_survivors(outcomes: list[AgentOutcome]) -> Optional[AgentOutcome]:
@@ -260,6 +378,13 @@ async def run_episode(
     *,
     pool: Optional[list[AgentSpec]] = None,
 ) -> dict:
+    # ---- syntax error fast-path ----
+    # Racing 4 models + Docker gates to add a missing colon is absurd. When
+    # the plugin flagged this as a parse-time error, skip the tournament and
+    # go direct to single-model → tiny patch.
+    if "SyntaxError [parse-time]" in request.stacktrace:
+        return await _run_syntax_fast_path(request)
+
     specs = pool or default_agent_pool()
 
     episode_id = supa.insert_episode(

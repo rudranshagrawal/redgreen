@@ -80,6 +80,12 @@ class WinnerPanel(
 
     fun show(winner: Winner, leaderboard: LeaderboardRow?) {
         currentWinner = winner
+        // Reset the apply-success state from any previous episode — otherwise the
+        // button stays disabled forever after the first Apply.
+        applyBtn.isEnabled = true
+        applyBtn.text = "Apply patch"
+        dismissBtn.text = "Dismiss"
+
         val addedLines = winner.patch_unified_diff.lines().count { it.startsWith("+") && !it.startsWith("+++ ") }
         val removedLines = winner.patch_unified_diff.lines().count { it.startsWith("-") && !it.startsWith("--- ") }
         val friendlyTime = RedGreenToolWindow.humanizeMs(winner.total_elapsed_ms)

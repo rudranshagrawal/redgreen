@@ -3,6 +3,7 @@ package com.redgreen
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.vfs.LocalFileSystem
+import com.redgreen.inlay.ApplyBridge
 import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBPanel
@@ -54,6 +55,13 @@ class WinnerPanel(
     }
 
     private var currentWinner: Winner? = null
+
+    init {
+        // Let the editor inlay invoke the same apply path.
+        ApplyBridge.register { _, winner ->
+            if (winner === currentWinner) applyCurrentPatch()
+        }
+    }
 
     val root: JBPanel<JBPanel<*>> = JBPanel<JBPanel<*>>(BorderLayout()).apply {
         border = JBUI.Borders.compound(

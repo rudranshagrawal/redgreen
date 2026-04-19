@@ -3,6 +3,7 @@ package com.redgreen
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowFactory
+import com.redgreen.inlay.WinnerInlay
 import com.intellij.ui.JBColor
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBPanel
@@ -70,6 +71,7 @@ class RedGreenToolWindow(private val project: Project) {
 
     private var winnerAgentName: String? = null
     private var lastStatus: StatusResponse? = null
+    private var currentFramePath: Pair<String, Int>? = null
 
     private val statusRenderer = StatusCellRenderer { winnerAgentName }
     private val winnerRowRenderer = WinnerRowRenderer { winnerAgentName }
@@ -174,6 +176,8 @@ class RedGreenToolWindow(private val project: Project) {
 
     fun showAnalyzing(payload: AnalyzePayload) {
         isSyntaxMode = "SyntaxError [parse-time]" in payload.stacktrace
+        currentFramePath = payload.frame_file to payload.frame_line
+        WinnerInlay.clear(project)
         if (isSyntaxMode) {
             title.text = "RedGreen · syntax fix · fast-path"
             subtitle.text = "Parse-time error — one-shot fix, no race."
@@ -246,9 +250,15 @@ class RedGreenToolWindow(private val project: Project) {
             }
             "completed" -> {
                 subtitle.text = if (isSyntaxMode) "Syntax fix ready." else "Race complete · winner found."
-                status.winner?.let {
-                    winnerAgentName = it.agent
-                    winnerPanel.show(it, status.leaderboard_row, isSyntaxMode)
+                status.winner?.let { winner ->
+                    winnerAgentName = winner.agent
+                    winnerPanel.show(winner, status.leaderboard_row, isSyntaxMode)
+                    // Drop an inline hint in the editor at the failing line.
+                    // The hint is clickable — same apply path as the button.
+                    currentFramePath?.let { frame ->
+                        val (path, line) = frame
+                        WinnerInlay.show(project, path, line, winner)
+                    }
                 }
                 banner.text = " "
                 agentTable.repaint()

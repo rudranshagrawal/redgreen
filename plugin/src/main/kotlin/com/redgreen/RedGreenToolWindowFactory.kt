@@ -53,6 +53,7 @@ class RedGreenToolWindow(private val project: Project) {
 
     /** True if the current episode came from the PSI syntax-error fallback. */
     private var isSyntaxMode: Boolean = false
+    private var placeholdersCleared: Boolean = true
     private val contextLine = JBLabel(" ").apply {
         font = JBFont.small()
         foreground = JBColor.GRAY
@@ -185,13 +186,16 @@ class RedGreenToolWindow(private val project: Project) {
         winnerAgentName = null
         clearAgents()
         if (isSyntaxMode) {
-            // Single lane, labeled honestly.
             agentTableModel.addRow(arrayOf<Any>("syntax-fix", "gpt-5-mini", "thinking…", "—", ""))
+            placeholdersCleared = true
         } else {
-            // Seed all four so the table doesn't flash empty.
-            for ((agent, model) in DEFAULT_POOL) {
-                agentTableModel.addRow(arrayOf<Any>(humanAgentName(agent), model, "queued", "—", ""))
+            // Router picks the 4 agents per-episode. We don't know the names
+            // yet, so seed generic placeholders and swap them out on the
+            // first real /status poll.
+            for (i in 1..4) {
+                agentTableModel.addRow(arrayOf<Any>("agent $i · routing…", "—", "queued", "—", ""))
             }
+            placeholdersCleared = false
         }
         winnerPanel.root.isVisible = false
         detailHeader.text = if (isSyntaxMode) "Single-shot syntax fix — no race details." else "Select an agent to see details."
@@ -229,6 +233,10 @@ class RedGreenToolWindow(private val project: Project) {
                 }
             }
         } else {
+            if (!placeholdersCleared && status.agents.isNotEmpty()) {
+                clearAgents()
+                placeholdersCleared = true
+            }
             status.agents.forEach(::appendOrUpdateAgent)
         }
 
@@ -339,6 +347,14 @@ class RedGreenToolWindow(private val project: Project) {
             "input_shape" -> "input_shape · 'wrong shape?'"
             "async_race" -> "async_race · 'bad ordering?'"
             "config_drift" -> "config_drift · 'wrong config?'"
+            "math_error" -> "math_error · 'bad arithmetic?'"
+            "resource_leak" -> "resource_leak · 'forgot to close?'"
+            "encoding" -> "encoding · 'bytes vs str?'"
+            "recursion" -> "recursion · 'no base case?'"
+            "api_contract" -> "api_contract · 'signature drift?'"
+            "timezone" -> "timezone · 'tz-aware mix?'"
+            "auth_permission" -> "auth_permission · '401/403?'"
+            "dependency_missing" -> "dependency · 'bad import?'"
             else -> agent
         }
 

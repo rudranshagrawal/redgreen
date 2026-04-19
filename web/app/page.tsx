@@ -33,6 +33,30 @@ function humanizeAgo(iso: string): string {
   return `${Math.floor(diff / 86_400_000)}d ago`;
 }
 
+function humanizeRepo(raw: string): { label: string; kind: string } {
+  // git sha: 40 hex chars
+  if (/^[0-9a-f]{40}$/.test(raw)) {
+    return { label: `Project @ ${raw.slice(0, 7)}`, kind: "git" };
+  }
+  if (raw.startsWith("seed:")) {
+    return { label: `Seed: ${raw.slice(5)}`, kind: "seed" };
+  }
+  if (raw.startsWith("debugger:")) {
+    const path = raw.slice("debugger:".length);
+    const base = path.split("/").filter(Boolean).pop() ?? "project";
+    return { label: base, kind: "debugger" };
+  }
+  if (raw.startsWith("plugin-smoke:")) {
+    const path = raw.slice("plugin-smoke:".length);
+    const base = path.split("/").filter(Boolean).pop() ?? "project";
+    return { label: `Smoke: ${base}`, kind: "smoke" };
+  }
+  if (raw.startsWith("poll-test") || raw.startsWith("manual:")) {
+    return { label: raw, kind: "misc" };
+  }
+  return { label: raw, kind: "unknown" };
+}
+
 export default async function Page() {
   const [leaderboard, episodes, stats] = await Promise.all([
     readLeaderboard(),
@@ -166,10 +190,14 @@ function LeaderboardBlock({
       ? Math.round((top.wins / top.total_attempts) * 100)
       : 0;
 
+  const { label: repoLabel, kind: repoKind } = humanizeRepo(repo);
   return (
     <div className="rounded-xl border border-line bg-panel overflow-hidden">
       <div className="flex items-baseline justify-between px-5 py-3 border-b border-line">
-        <div className="font-mono text-xs text-dim truncate">{repo}</div>
+        <div className="flex items-baseline gap-2 truncate">
+          <span className="font-medium truncate">{repoLabel}</span>
+          <span className="font-mono text-[10px] uppercase tracking-widest text-dim">{repoKind}</span>
+        </div>
         {top && (
           <div className="text-xs text-dim">
             predicts{" "}

@@ -1,37 +1,37 @@
-"""System prompts for each of the 4 hypotheses.
+"""System prompts for each hypothesis lens.
 
-Each hypothesis is an opinionated lens on what kind of bug the model should
-look for. Models race to produce `(test_code, patch, rationale)`; the referee
-then decides which lenses were actually right on this codebase. Episode 1
-knows nothing about which lens to trust — episode 20 does.
+Twelve lenses now (was four). A router in `orchestrator.select_agents`
+picks up to 4 per episode based on the exception type + frame keywords,
+so the race is always against bug-type-relevant agents.
 
-Contract with the model:
-
-- `test_code`: a pytest test that fails on the current code and passes after
-  the patch is applied. Must import from the repo's modules (not inline).
-  DO NOT use `pytest.raises(...)` as the sole assertion — that pattern passes
-  on the buggy code and fails after the fix, which is backwards.
-- `patch`: unified diff (`--- a/PATH` / `+++ b/PATH` / `@@` hunks) anchored
-  on the file path relative to the repo root.
-- `rationale`: one paragraph, plain English, why this is the bug.
+Contract with the model — every lens emits:
+  - test_code: a pytest test that fails on the current code and passes
+    after the patch is applied. Must import from the repo (not inline).
+  - patch: unified diff (--- a/PATH / +++ b/PATH / @@ hunks) anchored
+    on the file path relative to the repo root.
+  - rationale: one paragraph, plain English, why this is the bug.
 """
 
 from __future__ import annotations
 
 from typing import Literal
 
-Hypothesis = Literal["null_guard", "input_shape", "async_race", "config_drift"]
+Hypothesis = Literal[
+    "null_guard", "input_shape", "async_race", "config_drift",
+    "math_error", "resource_leak", "encoding", "recursion",
+    "api_contract", "timezone", "auth_permission", "dependency_missing",
+]
 
 
 _OUTPUT_CONTRACT = """\
 Return a single JSON object with exactly these keys:
-  - "test_code": string. A complete pytest test module. Must fail on the
-    current code (because the bug is present) and pass after `patch` is applied.
-    Import the function(s) under test from the repo's package — do not inline
-    the implementation. Do not use `pytest.raises` as the sole assertion.
-  - "patch": string. A unified diff starting with `--- a/<path>` and `+++ b/<path>`,
-    paths relative to the repo root. One file only. Keep the change minimal —
-    ideally 1-5 lines.
+  - "test_code": string. A complete pytest test module that fails on the
+    current buggy code and passes after `patch` is applied. Import the
+    function(s) under test from the repo's package — do not inline the
+    implementation. Do not use `pytest.raises` as the sole assertion.
+  - "patch": string. A unified diff starting with `--- a/<path>` and
+    `+++ b/<path>`, paths relative to the repo root. One file only.
+    Keep the change minimal — ideally 1-5 lines.
   - "rationale": string. One paragraph. Plain English. Why this is the bug,
     under the hypothesis lens you were given.
 
@@ -39,60 +39,108 @@ Respond with ONLY the JSON object. No prose, no code fences, no markdown.
 """
 
 
+# ---------- original four ----------
+
 NULL_GUARD = f"""\
-You are the `null_guard` agent in a racing tournament of bug-fixing models.
-
-Your lens: the failing code is crashing because something that can legitimately
-be None (or empty, or unset) is being used as if it were always present. The
-fix is a guard clause at the right place — an early return, an `or default`,
-a domain-specific exception, etc. — that preserves intended behavior for the
-normal path.
-
-Do NOT rewrite the function. Add the smallest, clearest guard.
-
+You are the `null_guard` agent. Lens: something that can legitimately be
+None/empty/unset is being used as if it's always present. Fix: smallest
+guard clause — early return, default value, or raise a domain error.
+Don't rewrite the function.
 {_OUTPUT_CONTRACT}
 """
 
 INPUT_SHAPE = f"""\
-You are the `input_shape` agent.
-
-Your lens: the caller passed data in a shape the callee didn't expect — a
-list instead of a tuple, a dict instead of a dataclass, an int instead of a
-Decimal, a bytes instead of a str, etc. The fix is either a coercion at the
-boundary, a typed parse, or an explicit validation error.
-
-Do NOT invent new validation layers. Coerce or validate at the specific call
-site where the shape mismatch enters.
-
+You are the `input_shape` agent. Lens: the caller passed data in a shape
+the callee didn't expect (list instead of tuple, dict instead of object,
+int instead of Decimal, etc.). Fix: coerce, validate, or raise at the
+entry point. Don't invent new validation layers.
 {_OUTPUT_CONTRACT}
 """
 
 ASYNC_RACE = f"""\
-You are the `async_race` agent.
-
-Your lens: the failing code depends on ordering or atomicity that isn't
-actually enforced — a missing `await`, an `asyncio.gather` losing exceptions,
-a shared mutable captured by a closure in a loop, a thread reading a value
-before another thread writes it, a cache populated after it's read.
-
-The fix is structural (add the await, use a lock, freeze the closure, reorder
-the ops) — never "add a retry" or "add a sleep".
-
+You are the `async_race` agent. Lens: an ordering, atomicity, or
+shared-reference assumption that isn't actually enforced (missing await,
+loop-variable captured by closure, shared mutable state, cache populated
+after read). Fix is structural — add the await, bind the variable, use
+a lock, reorder. Never "add a retry" or "add a sleep".
 {_OUTPUT_CONTRACT}
 """
 
 CONFIG_DRIFT = f"""\
-You are the `config_drift` agent.
+You are the `config_drift` agent. Lens: code that works in one environment
+fails in another because of an env var, port, feature flag, or secret
+that drifted. Fix: make the config explicit, coerce types at read, fall
+back sensibly, or surface the miss with a clear error.
+{_OUTPUT_CONTRACT}
+"""
 
-Your lens: the code works in one environment and fails in another because an
-assumption about config drifted — a wrong env var default, a hard-coded URL,
-a port that differs in test, a feature flag that didn't roll out, a secret
-that got rotated.
+# ---------- new eight ----------
 
-The fix is to make the configuration explicit where it's used, fall back
-sensibly, or surface the miss with a clear error — not to paper over the
-missing value.
+MATH_ERROR = f"""\
+You are the `math_error` agent. Lens: arithmetic went wrong — divide by
+zero, numeric overflow, float precision drift, NaN propagation, integer
+truncation. Fix: guard the denominator, switch to Decimal, clamp to a
+sane range, or validate the input bounds. Don't wrap in try/except and
+swallow.
+{_OUTPUT_CONTRACT}
+"""
 
+RESOURCE_LEAK = f"""\
+You are the `resource_leak` agent. Lens: a file, socket, lock, or DB
+connection is opened but not closed on all paths — or the inverse (used
+after close). Fix: use a `with` block, a context manager, or move the
+cleanup into a finally. Don't just add another close() call; find the
+missing release.
+{_OUTPUT_CONTRACT}
+"""
+
+ENCODING = f"""\
+You are the `encoding` agent. Lens: bytes vs str confusion, wrong codec,
+locale-dependent default, or mojibake from double-decoding. Fix: decode
+at the boundary with an explicit codec, keep bytes as bytes internally,
+or normalize to NFC/NFKC when comparing. Don't sprinkle .encode() calls.
+{_OUTPUT_CONTRACT}
+"""
+
+RECURSION = f"""\
+You are the `recursion` agent. Lens: unbounded recursion, mutual recursion
+without a base case, or a default argument that preserves state across
+calls. Fix: add the base case, convert to iteration, or carry state
+explicitly. Never raise `sys.setrecursionlimit`.
+{_OUTPUT_CONTRACT}
+"""
+
+API_CONTRACT = f"""\
+You are the `api_contract` agent. Lens: a library or internal function
+changed signature/semantics — the caller is stuck on the old contract.
+Fix: update the call site to match the real current signature (check the
+actual imports/installed version). Don't pin the dependency to an older
+version; fix the caller.
+{_OUTPUT_CONTRACT}
+"""
+
+TIMEZONE = f"""\
+You are the `timezone` agent. Lens: aware vs naive datetime, DST edge,
+wrong tz at parse, or utcnow() ambiguity. Fix: use timezone-aware
+datetimes everywhere, convert at I/O boundaries, and never use
+datetime.utcnow() (it returns naive). Use datetime.now(timezone.utc).
+{_OUTPUT_CONTRACT}
+"""
+
+AUTH_PERMISSION = f"""\
+You are the `auth_permission` agent. Lens: 401/403, role/scope missing,
+token expired, or a check that short-circuits before authz ran. Fix:
+add the missing permission check, refresh expired tokens, or surface a
+clearer error — never catch and swallow the auth error.
+{_OUTPUT_CONTRACT}
+"""
+
+DEPENDENCY_MISSING = f"""\
+You are the `dependency_missing` agent. Lens: ImportError /
+ModuleNotFoundError from a package that isn't installed, a stdlib module
+used as a 3rd-party name, or a typo in the import. Fix: correct the
+import, suggest the right package name, or fall back gracefully with a
+clear error message.
 {_OUTPUT_CONTRACT}
 """
 
@@ -102,6 +150,14 @@ _PROMPTS: dict[Hypothesis, str] = {
     "input_shape": INPUT_SHAPE,
     "async_race": ASYNC_RACE,
     "config_drift": CONFIG_DRIFT,
+    "math_error": MATH_ERROR,
+    "resource_leak": RESOURCE_LEAK,
+    "encoding": ENCODING,
+    "recursion": RECURSION,
+    "api_contract": API_CONTRACT,
+    "timezone": TIMEZONE,
+    "auth_permission": AUTH_PERMISSION,
+    "dependency_missing": DEPENDENCY_MISSING,
 }
 
 
@@ -116,6 +172,7 @@ def user_prompt(
     frame_line: int,
     frame_source: str,
     locals_json: dict,
+    codebase_context: str | None = None,
 ) -> str:
     """Assemble the bounded context we hand every model."""
     import json as _json
@@ -123,17 +180,6 @@ def user_prompt(
     locals_preview = _json.dumps(locals_json, default=str, indent=2)[:2000]
     is_syntax_error = "SyntaxError [parse-time]" in stacktrace
 
-    # ---- import guidance (avoids "No module named 'seeds'" class of errors) ----
-    # The runner mounts `repo_snapshot_path` at /work and pytest runs with cwd=/work.
-    # Two layouts we support:
-    #   (a) flat scripts at repo root (e.g. zero_error.py at project root)
-    #       -> import as `from <stem> import X`
-    #   (b) src/ layout with pytest.ini pointing pythonpath=src
-    #       -> import as `from <pkg>.<module> import X`
-    #
-    # We build a CONCRETE template string the model can copy verbatim. Past
-    # runs showed models ignoring abstract prose ("use this style") but
-    # obeying literal templates.
     if "/" in frame_file and frame_file.startswith("src/"):
         module_path = frame_file.removeprefix("src/").removesuffix(".py").replace("/", ".")
         import_template = f"from {module_path} import <symbol>"
@@ -161,6 +207,18 @@ The bug makes importlib raise — test fails → RED.
 After your patch, importlib succeeds → test passes → GREEN.
 """
 
+    codebase_block = ""
+    if codebase_context and codebase_context.strip():
+        codebase_block = f"""\
+
+--- CODEBASE CONVENTIONS (use these idioms in your patch) ---
+{codebase_context.strip()[:2500]}
+
+Match these patterns. Prefer domain exceptions the project already defines.
+Use the same import style, test style, and error-handling idioms. Don't
+introduce new patterns if existing ones fit.
+"""
+
     return f"""\
 The user hit an exception in their debugger. Here is the failure:
 
@@ -176,7 +234,7 @@ line: {frame_line}
 
 --- locals at the failing frame (JSON, truncated) ---
 {locals_preview}
-{syntax_block}
+{syntax_block}{codebase_block}
 --- HARD RULES FOR test_code (ignore these and you lose) ---
 
 RULE 1 — IMPORT PATH. Your test file MUST import the failing symbol with:

@@ -13,6 +13,7 @@ data class AnalyzePayload(
     val frame_source: String,
     val repo_hash: String,
     val repo_snapshot_path: String,
+    val codebase_context: String? = null,
 )
 
 data class AnalyzeResponse(val episode_id: String)

@@ -1,4 +1,4 @@
-"""Wire contracts for RedGreen. FROZEN at M0.
+"""Wire contracts for RedGreen. FROZEN at M0, extended at M5.
 
 Plugin and backend implement to these schemas so neither side blocks on the
 other. The runner is internal to the backend but shares the same Pydantic
@@ -14,9 +14,24 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
-Agent = Literal["null_guard", "input_shape", "async_race", "config_drift"]
+# Agent catalog — the 4 originals plus 8 M5-era hypotheses. A dynamic
+# router selects up to 4 of these per episode based on the stacktrace.
+Agent = Literal[
+    "null_guard",
+    "input_shape",
+    "async_race",
+    "config_drift",
+    "math_error",
+    "resource_leak",
+    "encoding",
+    "recursion",
+    "api_contract",
+    "timezone",
+    "auth_permission",
+    "dependency_missing",
+]
 RunStatus = Literal["RED", "GREEN", "ERROR"]
 EpisodeState = Literal["racing", "completed", "no_winner"]
 
@@ -37,6 +52,10 @@ class AnalyzeRequest(BaseModel):
     repo_hash: str = Field(description="git sha of the project being debugged.")
     repo_snapshot_path: str = Field(
         description="Local path the runner can mount read-only.",
+    )
+    codebase_context: Optional[str] = Field(
+        default=None,
+        description="Optional summary of project conventions (imports, exceptions, test style, etc.) produced by the plugin's codebase indexer.",
     )
 
 

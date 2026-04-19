@@ -33,7 +33,9 @@ from dotenv import load_dotenv
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 load_dotenv(_REPO_ROOT / ".env.local", override=False)
 
-from backend import hypotheses, supa  # noqa: E402
+import random  # noqa: E402
+
+from backend import hypotheses, router, supa  # noqa: E402
 from backend.providers import (  # noqa: E402
     DEFAULT_NEBIUS_DEEPSEEK,
     DEFAULT_NEBIUS_LLAMA,
@@ -106,12 +108,44 @@ class AgentSpec:
 
 
 def default_agent_pool() -> list[AgentSpec]:
+    """Legacy fixed pairing kept for the CLI path / backward compatibility."""
     return [
         AgentSpec("null_guard", DEFAULT_OPENAI_MODEL, openai_codex_generate),
         AgentSpec("input_shape", DEFAULT_NEBIUS_LLAMA, nebius_generate),
         AgentSpec("async_race", DEFAULT_NEBIUS_QWEN, nebius_generate),
         AgentSpec("config_drift", DEFAULT_NEBIUS_DEEPSEEK, nebius_generate),
     ]
+
+
+# Ordered roster of available (model, provider_fn) pairs. The router picks
+# the hypothesis lenses per episode; we shuffle these across the picks.
+_MODEL_ROSTER: tuple[tuple[str, ProviderFn], ...] = (
+    (DEFAULT_OPENAI_MODEL, openai_codex_generate),
+    (DEFAULT_NEBIUS_LLAMA, nebius_generate),
+    (DEFAULT_NEBIUS_QWEN, nebius_generate),
+    (DEFAULT_NEBIUS_DEEPSEEK, nebius_generate),
+)
+
+
+def select_agents_for(request: AnalyzeRequest, *, seed: int | None = None) -> list[AgentSpec]:
+    """Route + rotate: pick top-4 hypotheses for this stacktrace, then assign
+    models to them via a per-episode shuffled roster.
+
+    The shuffle lets the leaderboard disentangle "which lens fits?" from
+    "which model is strong?" over many episodes — same model won't always
+    be paired with the same lens.
+    """
+    scores = router.score_hypotheses(request.stacktrace, request.frame_source)
+    picks = router.pick_top(scores, k=len(_MODEL_ROSTER))
+
+    rng = random.Random(seed if seed is not None else hash((request.repo_hash, request.frame_file, request.frame_line)))
+    shuffled_models = list(_MODEL_ROSTER)
+    rng.shuffle(shuffled_models)
+
+    specs: list[AgentSpec] = []
+    for agent_name, (model, provider) in zip(picks, shuffled_models):
+        specs.append(AgentSpec(agent_name, model, provider))
+    return specs
 
 
 # -------- per-agent outcome --------
@@ -145,6 +179,7 @@ async def _race_one_agent(spec: AgentSpec, request: AnalyzeRequest, episode_id: 
             frame_line=request.frame_line,
             frame_source=request.frame_source,
             locals_json=request.locals_json,
+            codebase_context=request.codebase_context,
         ),
         model=spec.model,
     )
@@ -395,7 +430,11 @@ async def run_episode(
     if "SyntaxError [parse-time]" in request.stacktrace:
         return await _run_syntax_fast_path(request)
 
-    specs = pool or default_agent_pool()
+    # Router picks the 4 most relevant hypotheses for this stacktrace and
+    # shuffles models across them so the leaderboard can separate
+    # hypothesis-fit from model-strength over time. `pool=` overrides
+    # (used by --solo in the CLI).
+    specs = pool or select_agents_for(request)
 
     episode_id = supa.insert_episode(
         repo_hash=request.repo_hash,

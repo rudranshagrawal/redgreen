@@ -125,22 +125,21 @@ def user_prompt(
 
     # ---- import guidance (avoids "No module named 'seeds'" class of errors) ----
     # The runner mounts `repo_snapshot_path` at /work and pytest runs with cwd=/work.
-    # Common project layouts:
-    #   (a) flat scripts at repo root (e.g. seeds/null_guard/zero_error.py)
-    #       -> import as `from <basename_without_ext> import X`
+    # Two layouts we support:
+    #   (a) flat scripts at repo root (e.g. zero_error.py at project root)
+    #       -> import as `from <stem> import X`
     #   (b) src/ layout with pytest.ini pointing pythonpath=src
-    #       -> import as `from <pkg>.<module> import X` based on frame_file
+    #       -> import as `from <pkg>.<module> import X`
     #
-    # Rule of thumb: look at frame_file. If it's like `foo.py` (no `/src/`),
-    # use `from foo import X`. If it's like `src/pkg/mod.py`, use
-    # `from pkg.mod import X`. NEVER prefix with `seeds.` or `repo.` — the
-    # runner has no idea about those.
+    # We build a CONCRETE template string the model can copy verbatim. Past
+    # runs showed models ignoring abstract prose ("use this style") but
+    # obeying literal templates.
     if "/" in frame_file and frame_file.startswith("src/"):
         module_path = frame_file.removeprefix("src/").removesuffix(".py").replace("/", ".")
-        import_hint = f'from {module_path} import <symbol>'
+        import_template = f"from {module_path} import <symbol>"
     else:
         stem = frame_file.rsplit("/", 1)[-1].removesuffix(".py")
-        import_hint = f'from {stem} import <symbol>'
+        import_template = f"from {stem} import <symbol>"
 
     syntax_block = ""
     if is_syntax_error:
@@ -178,18 +177,40 @@ line: {frame_line}
 --- locals at the failing frame (JSON, truncated) ---
 {locals_preview}
 {syntax_block}
---- HARD RULES FOR test_code (read carefully) ---
-* The runner mounts the repo at /work and runs `pytest tests/` from there.
-* Import the failing symbol using this style: `{import_hint}`. Do NOT prefix
-  with `seeds.`, `repo.`, `redgreen.`, or any directory name above the repo
-  root. Those packages DO NOT exist from pytest's perspective.
-* ALL executable code (function calls, prints, crashes) MUST live inside a
-  `def test_*` function. Nothing at module top level. If your test file has
-  the buggy call at module scope, pytest will crash during COLLECTION and
-  the RED gate will return ERROR instead of RED — you automatically lose.
-* Do NOT import pytest.raises as your only assertion — the test has to FAIL
-  on current code and PASS after the patch. `assert X == expected` is the
-  right pattern; `pytest.raises` is the inverted pattern and breaks the loop.
+--- HARD RULES FOR test_code (ignore these and you lose) ---
+
+RULE 1 — IMPORT PATH. Your test file MUST import the failing symbol with:
+
+    {import_template}
+
+Do NOT invent package paths. Specifically FORBIDDEN:
+  - from null_guard import ...     (that's the project folder name, not a package)
+  - from seeds.anything import ...  (no such package)
+  - from redgreen import ...        (no such package)
+  - import {frame_file.rsplit("/", 1)[-1].removesuffix(".py")} as ...  (use `from ... import`)
+
+RULE 2 — NO MODULE-SCOPE EXECUTION. Every function call, print, or
+expression that TRIGGERS the bug must live inside a `def test_*` function.
+Module-scope code runs during pytest COLLECTION, which returns rc=2, which
+the runner treats as ERROR — you lose automatically.
+
+  WRONG (collection dies):
+      from mymod import buggy
+      print(buggy(10))          # <-- this runs at collect time, boom
+      def test_x(): ...
+
+  RIGHT:
+      from mymod import buggy
+      def test_x():
+          assert buggy(10) == expected   # <-- runs inside pytest
+
+RULE 3 — NO `pytest.raises` AS THE SOLE ASSERTION. The test must FAIL on
+the current buggy code and PASS after your patch is applied.
+`with pytest.raises(X):` passes on buggy code (the exception IS raised as
+expected) and fails after the fix (no exception) — that's backwards.
+Use `assert actual == expected` instead.
+
+If your test file uses any pytest helper, start with `import pytest`.
 
 Propose a test + patch per the JSON contract.
 """

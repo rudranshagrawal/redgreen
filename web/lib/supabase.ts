@@ -54,9 +54,15 @@ export async function readLeaderboard(): Promise<LeaderboardRow[]> {
 }
 
 export async function readRecentEpisodes(limit = 15): Promise<EpisodeRow[]> {
+  // Hide "stalled" racing episodes — ones that started more than 3 minutes
+  // ago and never got a finalize_episode write. These are dead (backend
+  // crashed, plugin cancelled, uvicorn reload kicked in, etc.) and just
+  // clutter the dashboard. Real races resolve in 15–45s.
+  const cutoff = new Date(Date.now() - 3 * 60_000).toISOString();
   const { data, error } = await supabase()
     .from("episodes")
     .select("*")
+    .or(`state.neq.racing,created_at.gte.${cutoff}`)
     .order("created_at", { ascending: false })
     .limit(limit);
   if (error) throw error;

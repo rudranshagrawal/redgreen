@@ -78,10 +78,8 @@ class WinnerPanel(
         add(buttons, BorderLayout.SOUTH)
     }
 
-    fun show(winner: Winner, leaderboard: LeaderboardRow?) {
+    fun show(winner: Winner, leaderboard: LeaderboardRow?, isSyntaxMode: Boolean = false) {
         currentWinner = winner
-        // Reset the apply-success state from any previous episode — otherwise the
-        // button stays disabled forever after the first Apply.
         applyBtn.isEnabled = true
         applyBtn.text = "Apply patch"
         dismissBtn.text = "Dismiss"
@@ -89,12 +87,20 @@ class WinnerPanel(
         val addedLines = winner.patch_unified_diff.lines().count { it.startsWith("+") && !it.startsWith("+++ ") }
         val removedLines = winner.patch_unified_diff.lines().count { it.startsWith("-") && !it.startsWith("--- ") }
         val friendlyTime = RedGreenToolWindow.humanizeMs(winner.total_elapsed_ms)
-        title.text = "🏆  ${RedGreenToolWindow.humanAgentName(winner.agent)}  →  ${winner.model}   +$addedLines / −$removedLines lines   ·   $friendlyTime"
+        title.text = if (isSyntaxMode) {
+            "🛠  Syntax fix  →  ${winner.model}   +$addedLines / −$removedLines lines   ·   $friendlyTime"
+        } else {
+            "🏆  ${RedGreenToolWindow.humanAgentName(winner.agent)}  →  ${winner.model}   +$addedLines / −$removedLines lines   ·   $friendlyTime"
+        }
         rationale.text = winner.rationale.ifBlank { "(no rationale)" }
         rationale.caretPosition = 0
-        leaderboardHint.text = leaderboard?.let {
-            "Leaderboard on this codebase: ${RedGreenToolWindow.humanAgentName(it.agent)} — ${it.wins}W / ${it.losses}L, avg ${RedGreenToolWindow.humanizeMs(it.avg_ms)}"
-        } ?: "Leaderboard: first episode on this codebase."
+        leaderboardHint.text = if (isSyntaxMode) {
+            "Single-model fast-path · no race · no Docker gates"
+        } else {
+            leaderboard?.let {
+                "Leaderboard on this codebase: ${RedGreenToolWindow.humanAgentName(it.agent)} — ${it.wins}W / ${it.losses}L, avg ${RedGreenToolWindow.humanizeMs(it.avg_ms)}"
+            } ?: "Leaderboard: first episode on this codebase."
+        }
         renderColoredDiff(winner.patch_unified_diff)
         root.isVisible = true
         root.revalidate()

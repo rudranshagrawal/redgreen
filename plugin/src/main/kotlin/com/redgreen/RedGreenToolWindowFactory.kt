@@ -50,6 +50,9 @@ class RedGreenToolWindow(private val project: Project) {
     private val subtitle = JBLabel("Idle — run your code in Debug.").apply {
         font = JBFont.label().asBold()
     }
+
+    /** True if the current episode came from the PSI syntax-error fallback. */
+    private var isSyntaxMode: Boolean = false
     private val contextLine = JBLabel(" ").apply {
         font = JBFont.small()
         foreground = JBColor.GRAY
@@ -156,10 +159,12 @@ class RedGreenToolWindow(private val project: Project) {
     // ---------- state transitions ----------
 
     fun showIdle() {
+        title.text = "RedGreen · 4-agent race"
         subtitle.text = "Idle — run your code in Debug."
         contextLine.text = "When the debugger trips an exception, RedGreen fires automatically."
         banner.text = " "
         winnerAgentName = null
+        isSyntaxMode = false
         clearAgents()
         winnerPanel.root.isVisible = false
         detailHeader.text = "Select an agent to see details."
@@ -167,23 +172,34 @@ class RedGreenToolWindow(private val project: Project) {
     }
 
     fun showAnalyzing(payload: AnalyzePayload) {
-        subtitle.text = "Captured exception — preparing race…"
+        isSyntaxMode = "SyntaxError [parse-time]" in payload.stacktrace
+        if (isSyntaxMode) {
+            title.text = "RedGreen · syntax fix · fast-path"
+            subtitle.text = "Parse-time error — one-shot fix, no race."
+        } else {
+            title.text = "RedGreen · 4-agent race"
+            subtitle.text = "Captured exception — preparing race…"
+        }
         contextLine.text = "${payload.frame_file}:${payload.frame_line}"
         banner.text = " "
         winnerAgentName = null
         clearAgents()
-        // Seed the 4 expected lanes so the table doesn't flash empty.
-        for ((agent, model) in DEFAULT_POOL) {
-            agentTableModel.addRow(arrayOf<Any>(humanAgentName(agent), model, "queued", "—", ""))
+        if (isSyntaxMode) {
+            // Single lane, labeled honestly.
+            agentTableModel.addRow(arrayOf<Any>("syntax-fix", "gpt-5-mini", "thinking…", "—", ""))
+        } else {
+            // Seed all four so the table doesn't flash empty.
+            for ((agent, model) in DEFAULT_POOL) {
+                agentTableModel.addRow(arrayOf<Any>(humanAgentName(agent), model, "queued", "—", ""))
+            }
         }
         winnerPanel.root.isVisible = false
-        detailHeader.text = "Select an agent to see details."
+        detailHeader.text = if (isSyntaxMode) "Single-shot syntax fix — no race details." else "Select an agent to see details."
         detailBody.text = ""
     }
 
     fun showRacing(episodeId: String) {
-        subtitle.text = "Racing 4 agents in parallel…"
-        // The placeholder episode id is an internal artifact; don't show it.
+        subtitle.text = if (isSyntaxMode) "Parse-time error — one-shot fix, no race." else "Racing 4 agents in parallel…"
         if (!episodeId.startsWith("pending-")) {
             contextLine.text = "${contextLine.text.substringBefore(" · ")} · episode ${episodeId.take(8)}"
         }
@@ -191,26 +207,48 @@ class RedGreenToolWindow(private val project: Project) {
 
     fun showStatus(status: StatusResponse) {
         lastStatus = status
-        status.agents.forEach(::appendOrUpdateAgent)
+        if (isSyntaxMode) {
+            // In syntax fast-path we only ever get one agent row back; replace the
+            // placeholder lane in place instead of letting appendOrUpdateAgent key
+            // on humanAgentName (the backend stores it under `null_guard` for enum reasons).
+            status.agents.firstOrNull()?.let { a ->
+                val time = humanizeMs(a.elapsed_ms)
+                val phase = when (a.status) {
+                    "green_ok" -> "🏆 FIXED · parse succeeded"
+                    "error" -> "error"
+                    else -> "thinking…"
+                }
+                if (agentTableModel.rowCount == 0) {
+                    agentTableModel.addRow(arrayOf<Any>("syntax-fix", "gpt-5-mini", phase, time, a.eliminated_reason ?: ""))
+                } else {
+                    agentTableModel.setValueAt("syntax-fix", 0, 0)
+                    agentTableModel.setValueAt(a.model, 0, 1)
+                    agentTableModel.setValueAt(phase, 0, 2)
+                    agentTableModel.setValueAt(time, 0, 3)
+                    agentTableModel.setValueAt(a.eliminated_reason ?: "", 0, 4)
+                }
+            }
+        } else {
+            status.agents.forEach(::appendOrUpdateAgent)
+        }
 
         when (status.state) {
             "racing" -> {
-                subtitle.text = "Racing 4 agents in parallel…"
+                subtitle.text = if (isSyntaxMode) "Parse-time error — one-shot fix, no race." else "Racing 4 agents in parallel…"
             }
             "completed" -> {
-                subtitle.text = "Race complete · winner found."
+                subtitle.text = if (isSyntaxMode) "Syntax fix ready." else "Race complete · winner found."
                 status.winner?.let {
                     winnerAgentName = it.agent
-                    winnerPanel.show(it, status.leaderboard_row)
+                    winnerPanel.show(it, status.leaderboard_row, isSyntaxMode)
                 }
                 banner.text = " "
-                // Trigger re-render with winner highlight.
                 agentTable.repaint()
                 refreshDetailsPane()
             }
             "no_winner" -> {
-                subtitle.text = "Race complete · no winner."
-                banner.text = "All four models failed their gates. Click a row for details."
+                subtitle.text = if (isSyntaxMode) "Couldn't auto-fix — edit the file manually." else "Race complete · no winner."
+                banner.text = if (isSyntaxMode) "Fast-path model returned an empty patch." else "All four models failed their gates. Click a row for details."
                 banner.foreground = JBColor.ORANGE
             }
         }

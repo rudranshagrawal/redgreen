@@ -21,14 +21,47 @@ object UnifiedDiffApplier {
         val hunksByFile = parse(diffText)
         val modified = mutableListOf<String>()
         for ((relPath, hunks) in hunksByFile) {
-            val target = File(repoRoot, relPath)
-            if (!target.exists()) {
-                throw IllegalStateException("patch targets missing file: $relPath")
-            }
+            val target = resolveTarget(File(repoRoot), relPath)
+                ?: throw IllegalStateException("patch targets missing file: $relPath")
             applyHunksToFile(target, hunks)
             modified += target.absolutePath
         }
         return modified
+    }
+
+    /**
+     * Try, in order:
+     *   1. repoRoot + relPath as-is.
+     *   2. Progressively strip leading directories off relPath.
+     *      E.g. "seeds/null_guard/name.py" → try "null_guard/name.py", then
+     *      "name.py".
+     *   3. Find any file under repoRoot with the same basename. If exactly
+     *      one match, use it. Multiple matches → ambiguous, give up.
+     * Models routinely write longer-than-expected prefixes, especially for
+     * syntax-error fast-path. This makes the applier forgive that.
+     */
+    private fun resolveTarget(repoRoot: File, relPath: String): File? {
+        val direct = File(repoRoot, relPath)
+        if (direct.exists()) return direct
+
+        val segs = relPath.split("/")
+        for (start in 1 until segs.size) {
+            val candidate = File(repoRoot, segs.drop(start).joinToString("/"))
+            if (candidate.exists()) return candidate
+        }
+
+        val basename = segs.last()
+        val matches = repoRoot.walkTopDown()
+            .filter { it.isFile && it.name == basename }
+            .filter {
+                val p = it.absolutePath
+                !p.contains("/.gradle/") && !p.contains("/.venv/") &&
+                    !p.contains("/node_modules/") && !p.contains("/build/") &&
+                    !p.contains("/.next/")
+            }
+            .take(2)
+            .toList()
+        return matches.singleOrNull()
     }
 
     private data class Hunk(val lines: List<String>)

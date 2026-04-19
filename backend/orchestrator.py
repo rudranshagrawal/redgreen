@@ -287,6 +287,16 @@ SyntaxError at {request.frame_file}:{request.frame_line}.
 --- source around the bad line (line numbers are absolute) ---
 {request.frame_source}
 
+--- HARD RULE FOR THE DIFF ---
+The diff headers MUST use exactly this path (project-relative, nothing
+longer, nothing shorter):
+
+    --- a/{request.frame_file}
+    +++ b/{request.frame_file}
+
+Do NOT prefix with `seeds/`, `src/`, absolute paths, or any directory
+name that was in the stacktrace. The runner has no idea about those.
+
 Produce the minimal patch.
 """
 

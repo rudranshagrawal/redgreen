@@ -89,6 +89,8 @@ def _supabase_status(episode_id: str) -> Optional[StatusResponse]:
             files_touched=r.get("files_touched", 0) or 0,
             cross_val_passed=r.get("cross_val_passed") or 0,
             cross_val_failed=r.get("cross_val_failed") or 0,
+            regression_passed=r.get("regression_passed") or 0,
+            regression_failed=r.get("regression_failed") or 0,
         )
         for r in agent_rows
     ]
@@ -105,6 +107,10 @@ def _supabase_status(episode_id: str) -> Optional[StatusResponse]:
                 rationale=win_row.get("rationale") or "",
                 files_touched=win_row.get("files_touched", 1) or 1,
                 total_elapsed_ms=ep.get("total_elapsed_ms", 0) or 0,
+                cross_val_passed=win_row.get("cross_val_passed") or 0,
+                cross_val_failed=win_row.get("cross_val_failed") or 0,
+                regression_passed=win_row.get("regression_passed") or 0,
+                regression_failed=win_row.get("regression_failed") or 0,
             )
 
     leaderboard_row: Optional[LeaderboardRow] = None

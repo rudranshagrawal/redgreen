@@ -73,6 +73,13 @@ class RedGreenToolWindow(private val project: Project) {
     private var lastStatus: StatusResponse? = null
     private var currentFramePath: Pair<String, Int>? = null
 
+    // ---------- wall-clock ticker (so the user sees something changing while models think) ----------
+
+    private var episodeStartedNanos: Long = 0L
+    private val ticker = javax.swing.Timer(500) { _ ->
+        refreshPhaseSubtitle()
+    }.apply { isRepeats = true }
+
     private val statusRenderer = StatusCellRenderer { winnerAgentName }
     private val winnerRowRenderer = WinnerRowRenderer { winnerAgentName }
 
@@ -162,6 +169,7 @@ class RedGreenToolWindow(private val project: Project) {
     // ---------- state transitions ----------
 
     fun showIdle() {
+        ticker.stop()
         title.text = "RedGreen · 4-agent race"
         subtitle.text = "Idle — run your code in Debug."
         contextLine.text = "When the debugger trips an exception, RedGreen fires automatically."
@@ -177,13 +185,14 @@ class RedGreenToolWindow(private val project: Project) {
     fun showAnalyzing(payload: AnalyzePayload) {
         isSyntaxMode = "SyntaxError [parse-time]" in payload.stacktrace
         currentFramePath = payload.frame_file to payload.frame_line
+        episodeStartedNanos = System.nanoTime()
         WinnerInlay.clear(project)
         if (isSyntaxMode) {
             title.text = "RedGreen · syntax fix · fast-path"
             subtitle.text = "Parse-time error — one-shot fix, no race."
         } else {
             title.text = "RedGreen · 4-agent race"
-            subtitle.text = "Captured exception — preparing race…"
+            subtitle.text = "Routing · picking 4 of 12 hypothesis lenses…"
         }
         contextLine.text = "${payload.frame_file}:${payload.frame_line}"
         banner.text = " "
@@ -204,6 +213,38 @@ class RedGreenToolWindow(private val project: Project) {
         winnerPanel.root.isVisible = false
         detailHeader.text = if (isSyntaxMode) "Single-shot syntax fix — no race details." else "Select an agent to see details."
         detailBody.text = ""
+        ticker.restart()
+    }
+
+    /** Update the subtitle to narrate the current phase + wall-clock time.
+     *  Called on every tick and every status update so there's always movement
+     *  visible even during long LLM generations. */
+    private fun refreshPhaseSubtitle() {
+        if (isSyntaxMode) return
+        val elapsedS = if (episodeStartedNanos > 0) ((System.nanoTime() - episodeStartedNanos) / 1_000_000_000L).toInt() else 0
+        val agents = lastStatus?.agents ?: emptyList()
+
+        val phase: String = when {
+            lastStatus == null -> "Routing · picking 4 of 12 hypothesis lenses"
+            lastStatus?.state == "completed" -> "Race complete · winner found"
+            lastStatus?.state == "no_winner" -> "Race complete · no winner"
+            agents.isEmpty() -> "Routing · picking 4 of 12 hypothesis lenses"
+            else -> {
+                val modelDone = agents.count { it.status != "pending" || it.elapsed_ms > 0 }
+                val redDone = agents.count { it.status in setOf("red_ok", "red_failed", "green_ok", "green_failed", "regression_failed", "error") }
+                val cvDone = agents.count { it.status in setOf("green_ok", "green_failed", "regression_failed") }
+                val regDone = agents.count { it.status == "green_ok" || it.status == "regression_failed" }
+                val redPassers = agents.count { it.status != "red_failed" && it.status != "error" && it.status != "pending" }
+                when {
+                    modelDone < agents.size -> "Phase 1 · models generating · $modelDone / ${agents.size} done"
+                    redDone < agents.size -> "Phase 1 · RED gate · $redDone / ${agents.size} passed"
+                    cvDone < redPassers -> "Phase 2 · peer cross-validation · $cvDone / $redPassers done"
+                    regDone < cvDone -> "Phase 3 · regression gate · $regDone / $cvDone done"
+                    else -> "Phase 4 · judge reviewing survivors…"
+                }
+            }
+        }
+        subtitle.text = "$phase · ${elapsedS}s"
     }
 
     fun showRacing(episodeId: String) {
@@ -246,9 +287,10 @@ class RedGreenToolWindow(private val project: Project) {
 
         when (status.state) {
             "racing" -> {
-                subtitle.text = if (isSyntaxMode) "Parse-time error — one-shot fix, no race." else "Racing 4 agents in parallel…"
+                if (isSyntaxMode) subtitle.text = "Parse-time error — one-shot fix, no race." else refreshPhaseSubtitle()
             }
             "completed" -> {
+                ticker.stop()
                 subtitle.text = if (isSyntaxMode) "Syntax fix ready." else "Race complete · winner found."
                 status.winner?.let { winner ->
                     winnerAgentName = winner.agent
@@ -265,6 +307,7 @@ class RedGreenToolWindow(private val project: Project) {
                 refreshDetailsPane()
             }
             "no_winner" -> {
+                ticker.stop()
                 subtitle.text = if (isSyntaxMode) "Couldn't auto-fix — edit the file manually." else "Race complete · no winner."
                 banner.text = if (isSyntaxMode) "Fast-path model returned an empty patch." else "All four models failed their gates. Click a row for details."
                 banner.foreground = JBColor.ORANGE
@@ -273,6 +316,7 @@ class RedGreenToolWindow(private val project: Project) {
     }
 
     fun showError(msg: String) {
+        ticker.stop()
         subtitle.text = "Something broke."
         banner.text = msg
         banner.foreground = JBColor.RED

@@ -28,24 +28,50 @@ class WinnerPanel(
     private val onDismiss: () -> Unit,
 ) {
     private val title = JBLabel(" ").apply {
-        font = JBFont.label().asBold()
+        font = JBFont.h3().asBold()
         foreground = JBColor(0x3FB950, 0x3FB950)
+    }
+    private val scoreLine = JBLabel(" ").apply {
+        font = JBFont.small()
+        foreground = JBColor.GRAY
     }
     private val leaderboardHint = JBLabel(" ").apply {
         font = JBFont.small()
         foreground = JBColor.GRAY
     }
+    private val rationaleLabel = JBLabel("Why").apply {
+        font = JBFont.small().asBold()
+        foreground = JBColor.GRAY
+        border = BorderFactory.createEmptyBorder(6, 0, 2, 0)
+    }
     private val rationale = JTextPane().apply {
         isEditable = false
-        font = JBFont.label()
+        font = JBFont.small()
         foreground = JBColor.GRAY
         background = null
-        border = BorderFactory.createEmptyBorder(0, 0, 4, 0)
+        border = BorderFactory.createEmptyBorder(0, 0, 0, 0)
+    }
+    private val judgeLabel = JBLabel("Judge’s note").apply {
+        font = JBFont.small().asBold()
+        foreground = JBColor(0xB88800, 0xE0B84B)
+        border = BorderFactory.createEmptyBorder(6, 0, 2, 0)
+    }
+    private val judgeNote = JTextPane().apply {
+        isEditable = false
+        font = JBFont.small()
+        foreground = JBColor.GRAY
+        background = null
+        border = BorderFactory.createEmptyBorder(0, 0, 0, 0)
+    }
+    private val judgeBlock = JBPanel<JBPanel<*>>(BorderLayout()).apply {
+        isOpaque = false
+        add(judgeLabel, BorderLayout.NORTH)
+        add(judgeNote, BorderLayout.CENTER)
     }
     private val diffPane = JTextPane().apply {
         isEditable = false
         font = Font("Monospaced", Font.PLAIN, 12)
-        border = BorderFactory.createEmptyBorder(4, 4, 4, 4)
+        border = BorderFactory.createEmptyBorder(6, 6, 6, 6)
     }
     private val applyBtn = JButton("Apply patch").apply {
         addActionListener { applyCurrentPatch() }
@@ -69,16 +95,33 @@ class WinnerPanel(
             JBUI.Borders.empty(10, 0, 0, 0),
         )
 
+        // Header: big title, one score line, one leaderboard line. That's it.
         val header = JBPanel<JBPanel<*>>()
         header.layout = javax.swing.BoxLayout(header, javax.swing.BoxLayout.Y_AXIS)
         header.add(wrap(title))
+        header.add(wrap(scoreLine))
         header.add(wrap(leaderboardHint))
-        header.add(rationale)
         add(header, BorderLayout.NORTH)
 
-        val scroll = JBScrollPane(diffPane)
-        scroll.preferredSize = Dimension(400, 200)
-        add(scroll, BorderLayout.CENTER)
+        // Center: diff is the hero. Rationale + judge quote stack below in a
+        // compact, scrolling area so they never dominate.
+        val center = JBPanel<JBPanel<*>>(BorderLayout())
+        center.isOpaque = false
+        val diffScroll = JBScrollPane(diffPane).apply { preferredSize = Dimension(400, 220) }
+        center.add(diffScroll, BorderLayout.CENTER)
+
+        val notes = JBPanel<JBPanel<*>>()
+        notes.isOpaque = false
+        notes.layout = javax.swing.BoxLayout(notes, javax.swing.BoxLayout.Y_AXIS)
+        notes.add(rationaleLabel)
+        notes.add(rationale)
+        notes.add(judgeBlock)
+        val notesScroll = JBScrollPane(notes).apply {
+            preferredSize = Dimension(400, 90)
+            border = BorderFactory.createEmptyBorder()
+        }
+        center.add(notesScroll, BorderLayout.SOUTH)
+        add(center, BorderLayout.CENTER)
 
         val buttons = JBPanel<JBPanel<*>>(FlowLayout(FlowLayout.LEFT, 6, 6))
         buttons.add(applyBtn)
@@ -96,18 +139,46 @@ class WinnerPanel(
         val removedLines = winner.patch_unified_diff.lines().count { it.startsWith("-") && !it.startsWith("--- ") }
         val friendlyTime = RedGreenToolWindow.humanizeMs(winner.total_elapsed_ms)
         title.text = if (isSyntaxMode) {
-            "🛠  Syntax fix  →  ${winner.model}   +$addedLines / −$removedLines lines   ·   $friendlyTime"
+            "🛠  Syntax fix  ·  ${winner.model}"
         } else {
-            "🏆  ${RedGreenToolWindow.humanAgentName(winner.agent)}  →  ${winner.model}   +$addedLines / −$removedLines lines   ·   $friendlyTime"
+            "🏆  ${RedGreenToolWindow.humanAgentName(winner.agent).substringBefore(" ·")}  ·  ${winner.model}"
         }
-        rationale.text = winner.rationale.ifBlank { "(no rationale)" }
+
+        // One compact line of scores — the thing the old panel buried under rationale.
+        val totalCV = winner.cross_val_passed + winner.cross_val_failed
+        val totalReg = winner.regression_passed + winner.regression_failed
+        val parts = mutableListOf<String>()
+        parts += "+$addedLines / −$removedLines lines"
+        parts += friendlyTime
+        if (totalCV > 0) parts += "peer ${winner.cross_val_passed}/$totalCV"
+        if (totalReg > 0) parts += "regression ${winner.regression_passed}/$totalReg"
+        scoreLine.text = parts.joinToString("  ·  ")
+
+        // Split the combined rationale into model-voice + judge-voice blocks so
+        // neither walls of text dominate the panel.
+        val rawRationale = winner.rationale.ifBlank { "(no rationale)" }
+        val judgeMarker = "[Judge]"
+        val idx = rawRationale.indexOf(judgeMarker)
+        if (idx >= 0) {
+            val model = rawRationale.substring(0, idx).trim().trimEnd(',', '.', ';').take(280)
+            val judge = rawRationale.substring(idx + judgeMarker.length).trim().take(320)
+            rationale.text = model.ifBlank { "(no rationale)" }
+            judgeNote.text = judge
+            judgeBlock.isVisible = judge.isNotBlank()
+        } else {
+            rationale.text = rawRationale.take(360)
+            judgeNote.text = ""
+            judgeBlock.isVisible = false
+        }
         rationale.caretPosition = 0
+        judgeNote.caretPosition = 0
+
         leaderboardHint.text = if (isSyntaxMode) {
             "Single-model fast-path · no race · no Docker gates"
         } else {
             leaderboard?.let {
-                "Leaderboard on this codebase: ${RedGreenToolWindow.humanAgentName(it.agent)} — ${it.wins}W / ${it.losses}L, avg ${RedGreenToolWindow.humanizeMs(it.avg_ms)}"
-            } ?: "Leaderboard: first episode on this codebase."
+                "On this codebase: ${it.agent} leads ${it.wins}W / ${it.losses}L (avg ${RedGreenToolWindow.humanizeMs(it.avg_ms)})"
+            } ?: "First episode on this codebase — no priors yet."
         }
         renderColoredDiff(winner.patch_unified_diff)
         root.isVisible = true

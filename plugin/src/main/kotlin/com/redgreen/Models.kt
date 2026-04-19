@@ -39,6 +39,10 @@ data class Winner(
     val rationale: String,
     val files_touched: Int,
     val total_elapsed_ms: Int,
+    val cross_val_passed: Int = 0,
+    val cross_val_failed: Int = 0,
+    val regression_passed: Int = 0,
+    val regression_failed: Int = 0,
 )
 
 data class LeaderboardRow(

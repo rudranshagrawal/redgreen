@@ -108,6 +108,10 @@ class Winner(BaseModel):
     rationale: str
     files_touched: int
     total_elapsed_ms: int
+    cross_val_passed: int = 0
+    cross_val_failed: int = 0
+    regression_passed: int = 0
+    regression_failed: int = 0
 
 
 class LeaderboardRow(BaseModel):

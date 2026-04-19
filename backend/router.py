@@ -94,23 +94,34 @@ _KEYWORD_WEIGHTS: list[tuple[re.Pattern[str], dict[Agent, int]]] = [
     (re.compile(r"\bwith\s+[a-zA-Z_][a-zA-Z0-9_]*\("), {"resource_leak": -1}),  # likely fine
     (re.compile(r"\b(datetime|timezone|tzinfo|utcnow|astimezone)"), {"timezone": 1}),
     (re.compile(r"\b(requests\.|httpx\.|urllib|/api/)"), {"api_contract": 1}),
-    (re.compile(r"\b(token|bearer|jwt|oauth|role|permission)", re.IGNORECASE), {"auth_permission": 1}),
+    # Strong auth signals — standalone words, not substrings of data-structure names
+    # like `TokenBucket` or `token_bucket.py`. Worth +2 because real auth crashes
+    # get swamped otherwise by bystander keywords (decode on jwt.decode, os.environ).
+    (re.compile(r"\b(jwt|oauth|bearer)\b", re.IGNORECASE), {"auth_permission": 2}),
+    (re.compile(r"\b(permission|forbidden|unauthori[sz]ed|role)\b", re.IGNORECASE), {"auth_permission": 1}),
     (re.compile(r"\b(decode|encode|bytes\(|utf-?8|latin-?1|ascii)", re.IGNORECASE), {"encoding": 1}),
     (re.compile(r"\b(import\s+[a-zA-Z_][a-zA-Z0-9_]*|from\s+[a-zA-Z_])"), {"dependency_missing": 0}),  # informational
     (re.compile(r"\bis\s+None\b|\bNone\s+", re.IGNORECASE), {"null_guard": 1}),
-    (re.compile(r"\bDecimal\(|float\(|int\(|/\s*[a-zA-Z]"), {"math_error": 1}),
+    # Dropped `/\s*[a-zA-Z]` — matched every Unix path in every stacktrace,
+    # not an arithmetic signal. Keep only real numeric constructors.
+    (re.compile(r"\b(Decimal|Fraction)\(|float\(|int\("), {"math_error": 1}),
     (re.compile(r"\brecursion\b|\bself\.[a-zA-Z_]+\(.*self", re.IGNORECASE), {"recursion": 1}),
 ]
 
 
 def _extract_exception_type(stacktrace: str) -> str | None:
-    """Pull the `XxxError:` class name from the last line of a Python traceback."""
+    """Pull the `XxxError:` class name from the last line of a Python traceback.
+
+    Handles both bare (`ValueError:`) and dotted (`jwt.exceptions.InvalidTokenError:`)
+    forms — real-world tracebacks often include the module path.
+    """
     for line in reversed(stacktrace.splitlines()):
-        m = re.match(r"^([A-Z][A-Za-z0-9_]*(?:Error|Exception|Warning|StopIteration)):", line.strip())
+        stripped = line.strip()
+        # Dotted or bare: pick the last identifier before the colon.
+        m = re.match(r"^(?:[a-zA-Z_][a-zA-Z0-9_]*\.)*([A-Z][A-Za-z0-9_]*(?:Error|Exception|Warning|StopIteration)):", stripped)
         if m:
             return m.group(1)
-        # Also match "XxxError" bare (without colon) — sometimes models emit that.
-        m2 = re.match(r"^([A-Z][A-Za-z0-9_]*(?:Error|Exception))\s*$", line.strip())
+        m2 = re.match(r"^(?:[a-zA-Z_][a-zA-Z0-9_]*\.)*([A-Z][A-Za-z0-9_]*(?:Error|Exception))\s*$", stripped)
         if m2:
             return m2.group(1)
     return None

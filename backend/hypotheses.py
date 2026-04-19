@@ -121,6 +121,47 @@ def user_prompt(
     import json as _json
 
     locals_preview = _json.dumps(locals_json, default=str, indent=2)[:2000]
+    is_syntax_error = "SyntaxError [parse-time]" in stacktrace
+
+    # ---- import guidance (avoids "No module named 'seeds'" class of errors) ----
+    # The runner mounts `repo_snapshot_path` at /work and pytest runs with cwd=/work.
+    # Common project layouts:
+    #   (a) flat scripts at repo root (e.g. seeds/null_guard/zero_error.py)
+    #       -> import as `from <basename_without_ext> import X`
+    #   (b) src/ layout with pytest.ini pointing pythonpath=src
+    #       -> import as `from <pkg>.<module> import X` based on frame_file
+    #
+    # Rule of thumb: look at frame_file. If it's like `foo.py` (no `/src/`),
+    # use `from foo import X`. If it's like `src/pkg/mod.py`, use
+    # `from pkg.mod import X`. NEVER prefix with `seeds.` or `repo.` — the
+    # runner has no idea about those.
+    if "/" in frame_file and frame_file.startswith("src/"):
+        module_path = frame_file.removeprefix("src/").removesuffix(".py").replace("/", ".")
+        import_hint = f'from {module_path} import <symbol>'
+    else:
+        stem = frame_file.rsplit("/", 1)[-1].removesuffix(".py")
+        import_hint = f'from {stem} import <symbol>'
+
+    syntax_block = ""
+    if is_syntax_error:
+        syntax_block = """\
+
+--- THIS IS A PARSE-TIME ERROR ---
+PyCharm caught a SyntaxError before any of the module ran. The whole file fails
+to parse. That has two consequences:
+  1. A naive `from <module> import X` at the top of the test file will die
+     during pytest *collection*, which the runner records as ERROR (not RED).
+  2. The fix is usually trivial — a missing colon, unclosed paren, bad indent.
+Write the test using `importlib.import_module(...)` inside a test function:
+
+    import importlib
+    def test_module_parses():
+        importlib.import_module("<dotted.module.path>")
+
+The bug makes importlib raise — test fails → RED.
+After your patch, importlib succeeds → test passes → GREEN.
+"""
+
     return f"""\
 The user hit an exception in their debugger. Here is the failure:
 
@@ -136,6 +177,19 @@ line: {frame_line}
 
 --- locals at the failing frame (JSON, truncated) ---
 {locals_preview}
+{syntax_block}
+--- HARD RULES FOR test_code (read carefully) ---
+* The runner mounts the repo at /work and runs `pytest tests/` from there.
+* Import the failing symbol using this style: `{import_hint}`. Do NOT prefix
+  with `seeds.`, `repo.`, `redgreen.`, or any directory name above the repo
+  root. Those packages DO NOT exist from pytest's perspective.
+* ALL executable code (function calls, prints, crashes) MUST live inside a
+  `def test_*` function. Nothing at module top level. If your test file has
+  the buggy call at module scope, pytest will crash during COLLECTION and
+  the RED gate will return ERROR instead of RED — you automatically lose.
+* Do NOT import pytest.raises as your only assertion — the test has to FAIL
+  on current code and PASS after the patch. `assert X == expected` is the
+  right pattern; `pytest.raises` is the inverted pattern and breaks the loop.
 
 Propose a test + patch per the JSON contract.
 """

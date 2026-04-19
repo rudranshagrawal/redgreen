@@ -70,8 +70,17 @@ export async function readRecentEpisodes(limit = 15): Promise<EpisodeRow[]> {
 }
 
 export async function readAggregateStats() {
+  // Exclude "stalled" racing episodes from both numerator and denominator.
+  // An episode stuck in state='racing' more than 3 minutes is dead
+  // (backend restarted, plugin cancelled, etc.) — never had a chance
+  // to resolve, shouldn't drag the resolve rate down.
+  const cutoff = new Date(Date.now() - 3 * 60_000).toISOString();
+  const staleRacingFilter = `state.neq.racing,created_at.gte.${cutoff}`;
   const [{ count: total }, { count: completed }] = await Promise.all([
-    supabase().from("episodes").select("*", { count: "exact", head: true }),
+    supabase()
+      .from("episodes")
+      .select("*", { count: "exact", head: true })
+      .or(staleRacingFilter),
     supabase()
       .from("episodes")
       .select("*", { count: "exact", head: true })

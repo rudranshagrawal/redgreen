@@ -18,6 +18,7 @@ import com.intellij.xdebugger.frame.XExecutionStack
 import com.intellij.xdebugger.frame.XStackFrame
 import com.redgreen.AnalyzePayload
 import com.redgreen.RedGreenController
+import com.redgreen.indexer.CodebaseIndexer
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -90,16 +91,13 @@ private fun buildPayloadFromSession(session: XDebugSession): AnalyzePayload? {
 
     if (selected != null) {
         val pos = selected.sourcePosition ?: return null
-        return payloadFromFrame(base, pos.file, pos.line + 1, selected === topFrame)
+        return payloadFromFrame(base, pos.file, pos.line + 1, selected === topFrame, project)
     }
 
-    // No user frame anywhere — classic "exception was raised during module load"
-    // signature (SyntaxError, ImportError of a user file, etc.). Fall back to
-    // PyCharm's parser: find a PsiErrorElement in an open editor tab.
     val syntaxHit = findSyntaxErrorInOpenEditors(project)
     if (syntaxHit != null) {
         val (file, line, msg) = syntaxHit
-        return payloadFromSyntaxError(base, file, line, msg)
+        return payloadFromSyntaxError(base, file, line, msg, project)
     }
 
     return null
@@ -111,6 +109,7 @@ private fun payloadFromFrame(
     file: VirtualFile,
     line: Int,
     isTopFrame: Boolean,
+    project: com.intellij.openapi.project.Project,
 ): AnalyzePayload? {
     val relPath = file.path.removePrefix("$base/")
     val text = try {
@@ -123,6 +122,8 @@ private fun payloadFromFrame(
     val hi = minOf(lines.size, line - 1 + 20)
     val frameSource = (lo until hi).joinToString("\n") { "%4d: %s".format(it + 1, lines[it]) }
     val trace = buildSyntheticStacktrace(file.path, line, isTopFrame)
+    val indexer = CodebaseIndexer.getInstance(project)
+    indexer.ensureIndexed()
     return AnalyzePayload(
         stacktrace = trace,
         locals_json = emptyMap(),
@@ -131,6 +132,7 @@ private fun payloadFromFrame(
         frame_source = frameSource,
         repo_hash = "debugger:$base",
         repo_snapshot_path = base,
+        codebase_context = indexer.getContext(),
     )
 }
 
@@ -140,6 +142,7 @@ private fun payloadFromSyntaxError(
     file: VirtualFile,
     line: Int,
     msg: String,
+    project: com.intellij.openapi.project.Project,
 ): AnalyzePayload? {
     val relPath = file.path.removePrefix("$base/")
     val text = try {
@@ -152,9 +155,6 @@ private fun payloadFromSyntaxError(
     val hi = minOf(lines.size, line - 1 + 10)
     val frameSource = (lo until hi).joinToString("\n") { "%4d: %s".format(it + 1, lines[it]) }
 
-    // Special stacktrace so the backend knows this was caught at parse time.
-    // This prefix ("SyntaxError [parse-time]") is the signal the orchestrator's
-    // prompt builder picks up to switch guidance for the models.
     val trace = """
         SyntaxError [parse-time] — caught before any user code ran.
 
@@ -166,6 +166,8 @@ private fun payloadFromSyntaxError(
         collection doesn't die on the import line itself.
     """.trimIndent()
 
+    val indexer = CodebaseIndexer.getInstance(project)
+    indexer.ensureIndexed()
     return AnalyzePayload(
         stacktrace = trace,
         locals_json = emptyMap(),
@@ -174,6 +176,7 @@ private fun payloadFromSyntaxError(
         frame_source = frameSource,
         repo_hash = "debugger:$base",
         repo_snapshot_path = base,
+        codebase_context = indexer.getContext(),
     )
 }
 

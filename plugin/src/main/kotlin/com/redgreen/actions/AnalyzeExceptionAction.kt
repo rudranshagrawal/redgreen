@@ -6,6 +6,7 @@ import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.CommonDataKeys
 import com.redgreen.AnalyzePayload
 import com.redgreen.RedGreenController
+import com.redgreen.indexer.CodebaseIndexer
 
 /**
  * Manual fallback trigger. Sends the currently-focused file + caret position
@@ -46,6 +47,8 @@ class AnalyzeExceptionAction : AnAction() {
                 (user invoked the right-click action; no exception is actually raised)
         """.trimIndent()
 
+        val indexer = CodebaseIndexer.getInstance(project)
+        indexer.ensureIndexed()
         val payload = AnalyzePayload(
             stacktrace = stacktrace,
             locals_json = emptyMap(),
@@ -54,6 +57,7 @@ class AnalyzeExceptionAction : AnAction() {
             frame_source = frameSource,
             repo_hash = "manual:$base",
             repo_snapshot_path = base,
+            codebase_context = indexer.getContext(),
         )
 
         RedGreenController(project).analyze(payload)

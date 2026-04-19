@@ -71,7 +71,17 @@ def upsert_agent(
         payload["cross_val_passed"] = cross_val_passed
     if cross_val_failed is not None:
         payload["cross_val_failed"] = cross_val_failed
-    client().table("agents").upsert(payload, on_conflict="episode_id,agent").execute()
+    try:
+        client().table("agents").upsert(payload, on_conflict="episode_id,agent").execute()
+    except Exception as e:  # noqa: BLE001
+        # Schema v3 not applied yet? Fall back to legacy payload (drop the new fields).
+        msg = str(e)
+        if "cross_val" in msg and ("column" in msg.lower() or "does not exist" in msg.lower()):
+            payload.pop("cross_val_passed", None)
+            payload.pop("cross_val_failed", None)
+            client().table("agents").upsert(payload, on_conflict="episode_id,agent").execute()
+        else:
+            raise
 
 
 def finalize_episode(

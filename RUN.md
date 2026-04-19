@@ -64,7 +64,8 @@ just plugin-run
 
 First run downloads PyCharm (~1 GB, ~3 min). A sandbox PyCharm window opens with RedGreen pre-loaded. In the sandbox:
 
-1. `File → Open` → point at `~/rudy/coding-projects/redgreen/seeds/null_guard/` (or any seed)
+1. `File → Open` → point at **one specific seed**, e.g. `~/rudy/coding-projects/redgreen/seeds/null_guard/`.
+   **Do NOT open the parent `seeds/` folder.** The plugin sends the project root as the Docker mount point for the runner. If you open `seeds/`, every agent's patch targets `src/payments/refund.py` but the file actually lives at `null_guard/src/payments/refund.py` under the mount, so every patch fails to apply and you get `0/4 cross-val` across the board. Also, each seed's own `pytest.ini` only resolves imports correctly when that seed is the project root. One seed at a time — reopen the project to switch seeds.
 2. If it asks for a Python interpreter, pick `/opt/homebrew/bin/python3` or anything 3.11+
 3. Open `crash.py`
 4. Click the bug icon (▶ Debug). Python raises → the RedGreen tool window pops up on the right showing the race live.

@@ -91,6 +91,8 @@ class AgentResult(BaseModel):
     elapsed_ms: int = 0
     eliminated_reason: Optional[str] = None
     files_touched: int = 0
+    cross_val_passed: int = 0
+    cross_val_failed: int = 0
 
 
 class Winner(BaseModel):

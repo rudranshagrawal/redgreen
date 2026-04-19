@@ -25,6 +25,8 @@ data class AgentResult(
     val elapsed_ms: Int,
     val files_touched: Int = 0,
     val eliminated_reason: String? = null,
+    val cross_val_passed: Int = 0,
+    val cross_val_failed: Int = 0,
 )
 
 data class Winner(

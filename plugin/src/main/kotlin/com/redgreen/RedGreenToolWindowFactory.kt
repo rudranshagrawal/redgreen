@@ -301,16 +301,27 @@ class RedGreenToolWindow(private val project: Project) {
         while (agentTableModel.rowCount > 0) agentTableModel.removeRow(0)
     }
 
-    /** Phase label combines status + elapsed_ms to give richer live feedback. */
-    private fun phaseLabel(a: AgentResult): String = when {
-        a.status == "pending" && a.elapsed_ms == 0 -> "waiting for model…"
-        a.status == "pending" && a.elapsed_ms > 0 -> "model done · running RED gate"
-        a.status == "red_ok" -> "RED ✓ · running GREEN gate"
-        a.status == "red_failed" -> "RED ✗ failed"
-        a.status == "green_ok" -> if (a.agent == winnerAgentName) "🏆 WINNER · GREEN ✓" else "GREEN ✓ passed"
-        a.status == "green_failed" -> "GREEN ✗ failed"
-        a.status == "error" -> "model error"
-        else -> a.status
+    /** Phase label combines status + elapsed_ms + cross-val score. */
+    private fun phaseLabel(a: AgentResult): String {
+        val totalCV = a.cross_val_passed + a.cross_val_failed
+        val cvHint = if (totalCV > 0) " · ${a.cross_val_passed}/$totalCV peer tests" else ""
+        return when {
+            a.status == "pending" && a.elapsed_ms == 0 -> "waiting for model…"
+            a.status == "pending" && a.elapsed_ms > 0 -> "model done · running RED gate"
+            a.status == "red_ok" -> "RED ✓ · running GREEN gate"
+            a.status == "red_failed" -> "RED ✗ failed"
+            a.status == "green_ok" -> {
+                val hackHint = if (a.cross_val_passed > 0 && a.cross_val_failed >= a.cross_val_passed) " (weak)" else ""
+                if (a.agent == winnerAgentName) "🏆 WINNER · GREEN ✓$cvHint" else "GREEN ✓$cvHint$hackHint"
+            }
+            a.status == "green_failed" -> {
+                val why = a.eliminated_reason ?: ""
+                val suspectHack = totalCV > 0 && a.cross_val_passed <= totalCV / 2 && !why.contains("patch apply", ignoreCase = true)
+                "GREEN ✗$cvHint" + if (suspectHack) " (hacked literal?)" else ""
+            }
+            a.status == "error" -> "model error"
+            else -> a.status
+        }
     }
 
     private fun refreshDetailsPane() {

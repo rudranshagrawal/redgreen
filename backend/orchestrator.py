@@ -35,7 +35,7 @@ load_dotenv(_REPO_ROOT / ".env.local", override=False)
 
 import random  # noqa: E402
 
-from backend import hypotheses, router, supa  # noqa: E402
+from backend import hypotheses, judge, router, supa  # noqa: E402
 from backend.providers import (  # noqa: E402
     DEFAULT_NEBIUS_DEEPSEEK,
     DEFAULT_NEBIUS_LLAMA,
@@ -147,23 +147,76 @@ _MODEL_ROSTER: tuple[tuple[str, ProviderFn], ...] = (
 
 
 def select_agents_for(request: AnalyzeRequest, *, seed: int | None = None) -> list[AgentSpec]:
-    """Route + rotate: pick top-4 hypotheses for this stacktrace, then assign
-    models to them via a per-episode shuffled roster.
+    """Route + bias + rotate: pick top-4 hypotheses for this stacktrace,
+    then assign models — history-biased when we've seen this codebase
+    before, deterministic-shuffle on cold start.
 
-    The shuffle lets the leaderboard disentangle "which lens fits?" from
-    "which model is strong?" over many episodes — same model won't always
-    be paired with the same lens.
+    The feedback loop that makes "episode 20 picks the right model first
+    try" actually true:
+
+      1. router.score_hypotheses picks the lens candidates from the
+         exception type and frame keywords.
+      2. For each picked lens, we check supa.read_winner_history for
+         (lens, model) pairs that have won on THIS repo_hash before.
+         The winningest-available model gets that lens this episode.
+      3. Any lens with no prior win on this repo falls back to the
+         seeded random shuffle (so cold starts still look fair).
+      4. A model already assigned to a historical winner this episode
+         isn't reused for another lens — keeps the race diverse.
+
+    When no history exists (new codebase), behavior is identical to the
+    old pure-shuffle version. When history accumulates, the roster
+    reflects it — and the plugin's leaderboard preview ("predicts X with
+    Y% confidence") finally reflects the runtime choice, not just the
+    dashboard's retrospective.
     """
     scores = router.score_hypotheses(request.stacktrace, request.frame_source)
     picks = router.pick_top(scores, k=len(_MODEL_ROSTER))
 
-    rng = random.Random(seed if seed is not None else hash((request.repo_hash, request.frame_file, request.frame_line)))
+    # Historical winners for this codebase, if any.
+    try:
+        history = supa.read_winner_history(request.repo_hash)
+    except Exception as e:  # noqa: BLE001
+        # Don't let a transient Supabase hiccup block the race.
+        print(f"  [history] skipped: {e}", flush=True)
+        history = {}
+
+    rng = random.Random(
+        seed if seed is not None else hash((request.repo_hash, request.frame_file, request.frame_line))
+    )
     shuffled_models = list(_MODEL_ROSTER)
     rng.shuffle(shuffled_models)
+    roster_by_model = {m: p for m, p in _MODEL_ROSTER}
 
     specs: list[AgentSpec] = []
-    for agent_name, (model, provider) in zip(picks, shuffled_models):
-        specs.append(AgentSpec(agent_name, model, provider))
+    used_models: set[str] = set()
+    bias_notes: list[str] = []
+
+    for agent_name in picks:
+        # 1. History lookup: best prior (agent, model) pair still available.
+        history_pick: Optional[tuple[str, int]] = None
+        for (a, m), count in sorted(history.items(), key=lambda kv: -kv[1]):
+            if a == agent_name and m in roster_by_model and m not in used_models:
+                history_pick = (m, count)
+                break
+
+        if history_pick is not None:
+            model_name, wins = history_pick
+            specs.append(AgentSpec(agent_name, model_name, roster_by_model[model_name]))
+            used_models.add(model_name)
+            bias_notes.append(f"{agent_name}←{model_name} ({wins}W)")
+            continue
+
+        # 2. Cold-start / no-match-in-history: next model in shuffled order.
+        for model_name, provider in shuffled_models:
+            if model_name not in used_models:
+                specs.append(AgentSpec(agent_name, model_name, provider))
+                used_models.add(model_name)
+                bias_notes.append(f"{agent_name}←{model_name} (shuffle)")
+                break
+
+    if any("W)" in n for n in bias_notes):
+        print(f"  [feedback] {' | '.join(bias_notes)}", flush=True)
     return specs
 
 
@@ -477,17 +530,67 @@ def test_{module_stem}_parses():
 
 # -------- race all agents --------
 
-def _rank_survivors(outcomes: list[AgentOutcome]) -> Optional[AgentOutcome]:
-    """Cross-validated ranking:
-      1. Most cross-val tests passed (robustness — the core signal)
-      2. Fewest files touched (smaller patches win ties)
-      3. Fastest wall-clock (cosmetic tiebreak)
-    """
+def _rank_by_cross_val(outcomes: list[AgentOutcome]) -> list[AgentOutcome]:
+    """Cross-validation ordering: most peer tests passed, then fewest
+    files touched, then fastest wall-clock. Used both as the fallback
+    ranking and as the candidate shortlist for the quality judge."""
     survivors = [o for o in outcomes if o.status == "green_ok"]
-    if not survivors:
-        return None
     survivors.sort(key=lambda o: (-o.cross_val_passed, o.files_touched, o.elapsed_ms))
-    return survivors[0]
+    return survivors
+
+
+async def _judge_and_rank(
+    request: AnalyzeRequest, outcomes: list[AgentOutcome],
+) -> tuple[Optional[AgentOutcome], Optional[judge.JudgeVerdict]]:
+    """Combine cross-val score + quality judge into a final winner.
+
+    The judge picks based on idiomaticness (guard vs hack, domain
+    exception vs generic, match codebase conventions). The cross-val
+    score is the tiebreak if the judge returns something we can't use.
+    """
+    ranked = _rank_by_cross_val(outcomes)
+    if not ranked:
+        return None, None
+    if len(ranked) == 1:
+        return ranked[0], judge.JudgeVerdict(
+            winner_agent=ranked[0].spec.name,
+            reasoning="only one survivor; no judging needed.",
+            elapsed_ms=0,
+        )
+
+    # Ask the judge to re-rank the top survivors.
+    candidates = [
+        {
+            "agent": o.spec.name,
+            "model": o.spec.model,
+            "rationale": o.rationale,
+            "patch": o.patch,
+            "cross_val_passed": o.cross_val_passed,
+            "cross_val_failed": o.cross_val_failed,
+            "files_touched": o.files_touched,
+        }
+        for o in ranked[:3]
+    ]
+    verdict = await judge.rank_survivors(request, candidates)
+
+    if verdict.winner_agent:
+        judge_pick = next((o for o in ranked if o.spec.name == verdict.winner_agent), None)
+        if judge_pick is not None:
+            print(
+                f"  JUDGE    picked {judge_pick.spec.name} "
+                f"(cross-val {judge_pick.cross_val_passed}P, judge {verdict.elapsed_ms}ms): "
+                f"{verdict.reasoning[:160]}",
+                flush=True,
+            )
+            return judge_pick, verdict
+
+    # Judge errored or named an agent we don't recognize — fall back to cross-val top.
+    print(
+        f"  JUDGE    fell back to cross-val ranking ({verdict.error or 'no winner'}): "
+        f"{verdict.reasoning[:120]}",
+        flush=True,
+    )
+    return ranked[0], verdict
 
 
 async def run_episode(
@@ -551,7 +654,8 @@ async def run_episode(
     eliminated = [o for o in phase1 if o.status != "red_ok"]
     outcomes = eliminated + phase2
 
-    winner = _rank_survivors(outcomes)
+    # Phase 3: quality judge — picks the most idiomatic fix among top cross-val survivors.
+    winner, verdict = await _judge_and_rank(request, outcomes)
     total_elapsed = int((time.monotonic() - started) * 1000)
 
     if winner is None:
@@ -561,6 +665,20 @@ async def run_episode(
             "episode_id": episode_id, "winner": None, "outcomes": _serialize(outcomes),
             "total_elapsed_ms": total_elapsed,
         }
+
+    # Persist the judge's reasoning to the winner row so the UI can surface it.
+    judge_note = ""
+    if verdict is not None and verdict.winner_agent == winner.spec.name and verdict.reasoning:
+        judge_note = f"\n\n[Judge] {verdict.reasoning}"
+        supa.upsert_agent(
+            episode_id=episode_id, agent=winner.spec.name, model=winner.spec.model,
+            status="green_ok", elapsed_ms=winner.elapsed_ms,
+            files_touched=winner.files_touched,
+            test_code=winner.test_code, patch_unified_diff=winner.patch,
+            rationale=(winner.rationale or "") + judge_note,
+            cross_val_passed=winner.cross_val_passed,
+            cross_val_failed=winner.cross_val_failed,
+        )
 
     supa.finalize_episode(
         episode_id=episode_id, state="completed",
@@ -581,6 +699,7 @@ async def run_episode(
             "files_touched": winner.files_touched, "total_elapsed_ms": winner.elapsed_ms,
             "cross_val_passed": winner.cross_val_passed,
             "cross_val_failed": winner.cross_val_failed,
+            "judge_reasoning": verdict.reasoning if verdict else "",
         },
         "outcomes": _serialize(outcomes),
         "total_elapsed_ms": total_elapsed,

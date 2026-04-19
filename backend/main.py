@@ -87,6 +87,8 @@ def _supabase_status(episode_id: str) -> Optional[StatusResponse]:
             elapsed_ms=r.get("elapsed_ms", 0) or 0,
             eliminated_reason=r.get("eliminated_reason"),
             files_touched=r.get("files_touched", 0) or 0,
+            cross_val_passed=r.get("cross_val_passed") or 0,
+            cross_val_failed=r.get("cross_val_failed") or 0,
         )
         for r in agent_rows
     ]

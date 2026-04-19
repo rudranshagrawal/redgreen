@@ -52,6 +52,8 @@ def upsert_agent(
     test_code: str | None = None,
     patch_unified_diff: str | None = None,
     rationale: str | None = None,
+    cross_val_passed: int | None = None,
+    cross_val_failed: int | None = None,
 ) -> None:
     payload: dict[str, Any] = {
         "episode_id": episode_id,
@@ -65,6 +67,10 @@ def upsert_agent(
         "patch_unified_diff": patch_unified_diff,
         "rationale": rationale,
     }
+    if cross_val_passed is not None:
+        payload["cross_val_passed"] = cross_val_passed
+    if cross_val_failed is not None:
+        payload["cross_val_failed"] = cross_val_failed
     client().table("agents").upsert(payload, on_conflict="episode_id,agent").execute()
 
 
@@ -89,3 +95,26 @@ def finalize_episode(
 def read_leaderboard(repo_hash: str) -> list[dict]:
     res = client().table("leaderboard").select("*").eq("repo_hash", repo_hash).execute()
     return res.data or []
+
+
+def read_winner_history(repo_hash: str) -> dict[tuple[str, str], int]:
+    """Return {(winner_agent, winner_model): win_count} for all completed
+    episodes on this codebase. Used by select_agents_for to bias the model
+    roster toward historical winners — the "episode 20 picks the right
+    model first try" claim.
+    """
+    from collections import defaultdict
+    res = (
+        client().table("episodes")
+        .select("winner_agent, winner_model")
+        .eq("repo_hash", repo_hash)
+        .eq("state", "completed")
+        .execute()
+    )
+    counts: dict[tuple[str, str], int] = defaultdict(int)
+    for row in res.data or []:
+        agent = row.get("winner_agent")
+        model = row.get("winner_model")
+        if agent and model:
+            counts[(agent, model)] += 1
+    return dict(counts)

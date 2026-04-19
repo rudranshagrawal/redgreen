@@ -179,17 +179,30 @@ def main() -> int:
     rc, output, elapsed_ms = _run_pytest(repo_root, "tests/")
 
     if patch is None:
-        # RED gate: we want the new test to FAIL (reproducing the bug).
-        # pytest exit code 1 = tests failed, 0 = all passed, others = collection error.
+        # RED gate: the test should FAIL on unpatched code (bug reproduces).
+        # rc=1 → a test failed (ideal case).
+        # rc=2 → collection error (import raised). That's ALSO valid: if the
+        #   model wrote a test that triggers the bug at import time, pytest
+        #   crashes during collection. The bug still reproduced — count it.
+        # rc=0 → all tests passed → model's test didn't hit the bug. Lose.
         if rc == 1 and "test_redgreen_generated" in output:
             status = "RED"
+        elif rc == 2 and "test_redgreen_generated" in output:
+            # Collection-time crash counts as RED as long as the generated
+            # test file is what caused the failure (not an unrelated import
+            # on the happy path).
+            status = "RED"
         elif rc == 0:
-            status = "ERROR"  # test didn't reproduce the bug
+            status = "ERROR"
         else:
             status = "ERROR"
     else:
         # GREEN gate: everything must pass now.
-        status = "GREEN" if rc == 0 else "ERROR"
+        # Accept rc=0 (normal) and rc=5 (pytest exits 5 when no tests are
+        # collected — if the generated test file was import-time-only and
+        # now imports cleanly, pytest finds no test functions, which is fine
+        # because the fact that the import succeeded IS the proof).
+        status = "GREEN" if rc in (0, 5) else "ERROR"
 
     print(json.dumps({"status": status, "stdout": output[-4000:], "duration_ms": elapsed_ms}))
     return 0

@@ -23,7 +23,6 @@ Gate semantics:
 from __future__ import annotations
 
 import json
-import os
 import pathlib
 import re
 import subprocess
@@ -150,6 +149,24 @@ def _run_pytest(repo_root: pathlib.Path, target: str) -> tuple[int, str, int]:
     return proc.returncode, combined, elapsed_ms
 
 
+def _parse_pytest_counts(output: str) -> tuple[int, int, int]:
+    """Pull (passed, failed, errors) from a pytest summary line.
+
+    Works with both `-q` ("3 passed, 1 failed in 0.05s") and verbose outputs.
+    Missing numbers default to 0. Handles the summary appearing anywhere in
+    the last few hundred chars.
+    """
+    passed = failed = errors = 0
+    tail = output[-800:]
+    m = re.search(r"(\d+)\s+passed", tail)
+    if m: passed = int(m.group(1))
+    m = re.search(r"(\d+)\s+failed", tail)
+    if m: failed = int(m.group(1))
+    m = re.search(r"(\d+)\s+error", tail)
+    if m: errors = int(m.group(1))
+    return passed, failed, errors
+
+
 def main() -> int:
     raw = sys.stdin.read()
     try:
@@ -163,9 +180,19 @@ def main() -> int:
         print(json.dumps({"status": "ERROR", "stdout": f"snapshot missing: {repo_root}", "duration_ms": 0}))
         return 0
 
-    test_path = repo_root / NEW_TEST_PATH_RELATIVE
-    test_path.parent.mkdir(parents=True, exist_ok=True)
-    test_path.write_text(req["test_code"])
+    tests_dir = repo_root / "tests"
+    tests_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write test files. Two modes:
+    #   - legacy: `test_code` (single file) -> tests/test_redgreen_generated.py
+    #   - cross-val: `test_files` (dict name -> content) -> tests/<name>
+    #   Both can be present (rare, but supported — write both).
+    if req.get("test_files"):
+        for name, content in req["test_files"].items():
+            safe = pathlib.Path(name).name  # disallow path traversal
+            (tests_dir / safe).write_text(content)
+    if req.get("test_code"):
+        (tests_dir / NEW_TEST_PATH_RELATIVE.split("/", 1)[1]).write_text(req["test_code"])
 
     patch = req.get("patch_unified_diff")
     if patch:
@@ -175,36 +202,33 @@ def main() -> int:
             print(json.dumps({"status": "ERROR", "stdout": f"patch apply failed: {e}", "duration_ms": 0}))
             return 0
 
-    # Always run ALL tests so we catch regressions, not just the new one.
     rc, output, elapsed_ms = _run_pytest(repo_root, "tests/")
+    passed, failed, errors = _parse_pytest_counts(output)
 
     if patch is None:
-        # RED gate: the test should FAIL on unpatched code (bug reproduces).
-        # rc=1 → a test failed (ideal case).
-        # rc=2 → collection error (import raised). That's ALSO valid: if the
-        #   model wrote a test that triggers the bug at import time, pytest
-        #   crashes during collection. The bug still reproduced — count it.
-        # rc=0 → all tests passed → model's test didn't hit the bug. Lose.
+        # RED gate semantics unchanged.
         if rc == 1 and "test_redgreen_generated" in output:
             status = "RED"
         elif rc == 2 and "test_redgreen_generated" in output:
-            # Collection-time crash counts as RED as long as the generated
-            # test file is what caused the failure (not an unrelated import
-            # on the happy path).
             status = "RED"
         elif rc == 0:
             status = "ERROR"
         else:
             status = "ERROR"
     else:
-        # GREEN gate: everything must pass now.
-        # Accept rc=0 (normal) and rc=5 (pytest exits 5 when no tests are
-        # collected — if the generated test file was import-time-only and
-        # now imports cleanly, pytest finds no test functions, which is fine
-        # because the fact that the import succeeded IS the proof).
+        # GREEN gate. In cross-validation mode the caller wants the raw pass
+        # count regardless of status; in legacy mode keep the "all pass or bust"
+        # semantics so older flows still work.
         status = "GREEN" if rc in (0, 5) else "ERROR"
 
-    print(json.dumps({"status": status, "stdout": output[-4000:], "duration_ms": elapsed_ms}))
+    print(json.dumps({
+        "status": status,
+        "stdout": output[-4000:],
+        "duration_ms": elapsed_ms,
+        "passed": passed,
+        "failed": failed,
+        "errors": errors,
+    }))
     return 0
 
 

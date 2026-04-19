@@ -57,16 +57,29 @@ class RunnerResult:
     status: str  # RED | GREEN | ERROR
     stdout: str
     duration_ms: int
+    passed: int = 0
+    failed: int = 0
+    errors: int = 0
 
 
-def _run_in_docker_sync(*, test_code: str, patch: Optional[str], repo_snapshot_path: str) -> RunnerResult:
-    payload = {
+def _run_in_docker_sync(
+    *,
+    test_code: Optional[str] = None,
+    test_files: Optional[dict[str, str]] = None,
+    patch: Optional[str],
+    repo_snapshot_path: str,
+) -> RunnerResult:
+    payload: dict = {
         "episode_id": "n/a",
         "agent": "n/a",
-        "test_code": test_code,
         "patch_unified_diff": patch,
         "repo_snapshot_path": "/work",
     }
+    if test_files:
+        payload["test_files"] = test_files
+    if test_code:
+        payload["test_code"] = test_code
+
     cmd = [
         "docker", "run", "--rm", "--network", "none", "-i",
         "-v", f"{_REPO_ROOT / 'runner'}:/runner:ro",
@@ -80,11 +93,17 @@ def _run_in_docker_sync(*, test_code: str, patch: Optional[str], repo_snapshot_p
         obj = json.loads(proc.stdout)
     except json.JSONDecodeError:
         return RunnerResult(status="ERROR", stdout=f"bad runner stdout: {proc.stdout[:500]}", duration_ms=0)
-    return RunnerResult(status=obj["status"], stdout=obj.get("stdout", ""), duration_ms=int(obj.get("duration_ms", 0)))
+    return RunnerResult(
+        status=obj["status"],
+        stdout=obj.get("stdout", ""),
+        duration_ms=int(obj.get("duration_ms", 0)),
+        passed=int(obj.get("passed", 0)),
+        failed=int(obj.get("failed", 0)),
+        errors=int(obj.get("errors", 0)),
+    )
 
 
 async def run_in_docker(**kwargs) -> RunnerResult:
-    """Non-blocking wrapper so many runners can race in parallel."""
     return await asyncio.to_thread(_run_in_docker_sync, **kwargs)
 
 
@@ -163,11 +182,18 @@ class AgentOutcome:
     gen_ms: int = 0
     red_ms: int = 0
     green_ms: int = 0
+    cross_val_passed: int = 0
+    cross_val_failed: int = 0
 
 
-# -------- single-agent race --------
+def _slug(s: str) -> str:
+    import re
+    return re.sub(r"[^A-Za-z0-9_]+", "_", s)[:40]
 
-async def _race_one_agent(spec: AgentSpec, request: AnalyzeRequest, episode_id: str) -> AgentOutcome:
+
+# -------- phase 1: gen + RED gate (per agent) --------
+
+async def _phase1_gen_and_red(spec: AgentSpec, request: AnalyzeRequest, episode_id: str) -> AgentOutcome:
     tag = f"{spec.name:<13}"
     print(f"  {tag} start    model={spec.model}", flush=True)
 
@@ -230,53 +256,95 @@ async def _race_one_agent(spec: AgentSpec, request: AnalyzeRequest, episode_id: 
         )
         return outcome
 
-    # Live update: RED gate passed. Plugin shows "RED ✓ running GREEN".
+    # Phase 1 done. Record live state + return intermediate outcome for phase 2.
     supa.upsert_agent(
         episode_id=episode_id, agent=spec.name, model=spec.model,
         status="red_ok", elapsed_ms=gen_ms + red.duration_ms,
         test_code=gen["test_code"], patch_unified_diff=gen["patch"], rationale=gen["rationale"],
     )
-
-    # GREEN gate.
-    snap_green = _prepare_snapshot(pathlib.Path(request.repo_snapshot_path))
-    try:
-        green = await run_in_docker(test_code=gen["test_code"], patch=gen["patch"], repo_snapshot_path=str(snap_green))
-    finally:
-        shutil.rmtree(snap_green, ignore_errors=True)
-    print(f"  {tag} GREEN    {green.status} ({green.duration_ms}ms)", flush=True)
-
-    elapsed = gen_ms + red.duration_ms + green.duration_ms
     files_touched = max(1, gen["patch"].count("\n+++ b/"))
-    if green.status != "GREEN":
-        outcome = AgentOutcome(
-            spec=spec, status="green_failed", elapsed_ms=elapsed,
-            gen_ms=gen_ms, red_ms=red.duration_ms, green_ms=green.duration_ms,
-            files_touched=files_touched,
-            eliminated_reason=f"GREEN -> {green.status}: {green.stdout[-300:]}",
-            test_code=gen["test_code"], patch=gen["patch"], rationale=gen["rationale"],
-        )
-        supa.upsert_agent(
-            episode_id=episode_id, agent=spec.name, model=spec.model,
-            status=outcome.status, elapsed_ms=outcome.elapsed_ms,
-            files_touched=outcome.files_touched,
-            eliminated_reason=outcome.eliminated_reason,
-            test_code=outcome.test_code, patch_unified_diff=outcome.patch, rationale=outcome.rationale,
-        )
-        return outcome
-
-    outcome = AgentOutcome(
-        spec=spec, status="green_ok", elapsed_ms=elapsed,
-        gen_ms=gen_ms, red_ms=red.duration_ms, green_ms=green.duration_ms,
-        files_touched=files_touched,
+    return AgentOutcome(
+        spec=spec, status="red_ok", elapsed_ms=gen_ms + red.duration_ms,
+        gen_ms=gen_ms, red_ms=red.duration_ms, files_touched=files_touched,
         test_code=gen["test_code"], patch=gen["patch"], rationale=gen["rationale"],
     )
+
+
+# -------- phase 2: cross-validated GREEN gate --------
+
+async def _phase2_cross_validate(
+    outcome: AgentOutcome,
+    combined_tests: dict[str, str],
+    request: AnalyzeRequest,
+    episode_id: str,
+) -> AgentOutcome:
+    """Apply this agent's patch to a fresh snapshot, then run ALL agents'
+    test files (plus any pre-existing tests). A patch that's a hack will
+    fail peers' tests; a robust patch passes most of them.
+    """
+    spec = outcome.spec
+    tag = f"{spec.name:<13}"
+
+    snap = _prepare_snapshot(pathlib.Path(request.repo_snapshot_path))
+    try:
+        cv = await run_in_docker(
+            test_files=combined_tests,
+            patch=outcome.patch,
+            repo_snapshot_path=str(snap),
+        )
+    finally:
+        shutil.rmtree(snap, ignore_errors=True)
+
+    print(
+        f"  {tag} CROSS    {cv.passed} passed, {cv.failed} failed, {cv.errors} errors "
+        f"({cv.duration_ms}ms)",
+        flush=True,
+    )
+
+    elapsed = outcome.gen_ms + outcome.red_ms + cv.duration_ms
+    # A patch is a survivor if it passes a simple majority of cross-val tests.
+    # The runner returns status=ERROR whenever rc!=0 (any failure), but here
+    # rc=1 is the EXPECTED case — we want the patch that survives the most
+    # peer scrutiny. "All 4 agents pass 10/12" is a legit outcome; the
+    # ranking below resolves ties by files_touched + elapsed.
+    total_tests = cv.passed + cv.failed + cv.errors
+    is_majority_pass = cv.passed >= max(1, total_tests // 2 + 1)
+
+    if cv.passed == 0:
+        final = AgentOutcome(
+            spec=spec, status="green_failed", elapsed_ms=elapsed,
+            gen_ms=outcome.gen_ms, red_ms=outcome.red_ms, green_ms=cv.duration_ms,
+            files_touched=outcome.files_touched,
+            cross_val_passed=cv.passed, cross_val_failed=cv.failed,
+            eliminated_reason=f"cross-val: 0 of {total_tests} tests passed — {cv.stdout[-200:]}",
+            test_code=outcome.test_code, patch=outcome.patch, rationale=outcome.rationale,
+        )
+    elif not is_majority_pass:
+        final = AgentOutcome(
+            spec=spec, status="green_failed", elapsed_ms=elapsed,
+            gen_ms=outcome.gen_ms, red_ms=outcome.red_ms, green_ms=cv.duration_ms,
+            files_touched=outcome.files_touched,
+            cross_val_passed=cv.passed, cross_val_failed=cv.failed,
+            eliminated_reason=f"cross-val: only {cv.passed}/{total_tests} passed (minority)",
+            test_code=outcome.test_code, patch=outcome.patch, rationale=outcome.rationale,
+        )
+    else:
+        final = AgentOutcome(
+            spec=spec, status="green_ok", elapsed_ms=elapsed,
+            gen_ms=outcome.gen_ms, red_ms=outcome.red_ms, green_ms=cv.duration_ms,
+            files_touched=outcome.files_touched,
+            cross_val_passed=cv.passed, cross_val_failed=cv.failed,
+            test_code=outcome.test_code, patch=outcome.patch, rationale=outcome.rationale,
+        )
+
     supa.upsert_agent(
         episode_id=episode_id, agent=spec.name, model=spec.model,
-        status=outcome.status, elapsed_ms=outcome.elapsed_ms,
-        files_touched=outcome.files_touched,
-        test_code=outcome.test_code, patch_unified_diff=outcome.patch, rationale=outcome.rationale,
+        status=final.status, elapsed_ms=final.elapsed_ms,
+        files_touched=final.files_touched,
+        eliminated_reason=final.eliminated_reason,
+        test_code=final.test_code, patch_unified_diff=final.patch, rationale=final.rationale,
     )
-    return outcome
+    return final
 
 
 # -------- syntax error fast-path --------
@@ -410,11 +478,15 @@ def test_{module_stem}_parses():
 # -------- race all agents --------
 
 def _rank_survivors(outcomes: list[AgentOutcome]) -> Optional[AgentOutcome]:
+    """Cross-validated ranking:
+      1. Most cross-val tests passed (robustness — the core signal)
+      2. Fewest files touched (smaller patches win ties)
+      3. Fastest wall-clock (cosmetic tiebreak)
+    """
     survivors = [o for o in outcomes if o.status == "green_ok"]
     if not survivors:
         return None
-    # Rank: fewest files touched, then fastest, then stable by spec order.
-    survivors.sort(key=lambda o: (o.files_touched, o.elapsed_ms))
+    survivors.sort(key=lambda o: (-o.cross_val_passed, o.files_touched, o.elapsed_ms))
     return survivors[0]
 
 
@@ -447,9 +519,37 @@ async def run_episode(
         supa.upsert_agent(episode_id=episode_id, agent=s.name, model=s.model, status="pending")
 
     started = time.monotonic()
-    print(f"\n=== episode {episode_id} — racing {len(specs)} agents ===", flush=True)
+    print(f"\n=== episode {episode_id} — phase 1: gen + RED for {len(specs)} agents ===", flush=True)
 
-    outcomes = await asyncio.gather(*[_race_one_agent(s, request, episode_id) for s in specs])
+    # Phase 1: every agent generates a candidate and proves their test reproduces the bug.
+    phase1 = await asyncio.gather(*[_phase1_gen_and_red(s, request, episode_id) for s in specs])
+
+    red_passers = [o for o in phase1 if o.status == "red_ok"]
+    if not red_passers:
+        total_elapsed = int((time.monotonic() - started) * 1000)
+        supa.finalize_episode(episode_id=episode_id, state="no_winner", total_elapsed_ms=total_elapsed)
+        print(f"\nno survivor past RED. total_ms={total_elapsed}", flush=True)
+        return {
+            "episode_id": episode_id, "winner": None,
+            "outcomes": _serialize(phase1),
+            "total_elapsed_ms": total_elapsed,
+        }
+
+    # Phase 2: cross-validation. Every RED-passer's patch runs against every
+    # RED-passer's tests. Robustness = # of peers' tests passed.
+    combined_tests = {
+        f"test_redgreen_{_slug(o.spec.name)}_{i}.py": o.test_code
+        for i, o in enumerate(red_passers)
+    }
+    print(f"\n=== phase 2: cross-validate {len(red_passers)} survivor(s) against {len(combined_tests)} tests ===", flush=True)
+
+    phase2 = await asyncio.gather(*[
+        _phase2_cross_validate(o, combined_tests, request, episode_id) for o in red_passers
+    ])
+
+    # Eliminated-at-phase-1 agents keep their earlier outcomes; merge for the response.
+    eliminated = [o for o in phase1 if o.status != "red_ok"]
+    outcomes = eliminated + phase2
 
     winner = _rank_survivors(outcomes)
     total_elapsed = int((time.monotonic() - started) * 1000)
@@ -469,7 +569,8 @@ async def run_episode(
     )
     print(
         f"\nwinner: {winner.spec.name} / {winner.spec.model} "
-        f"(files={winner.files_touched}, elapsed={winner.elapsed_ms}ms) "
+        f"(cross-val {winner.cross_val_passed}P/{winner.cross_val_failed}F, "
+        f"files={winner.files_touched}, elapsed={winner.elapsed_ms}ms) "
         f"total_ms={total_elapsed}",
         flush=True,
     )
@@ -478,6 +579,8 @@ async def run_episode(
         "winner": {
             "agent": winner.spec.name, "model": winner.spec.model,
             "files_touched": winner.files_touched, "total_elapsed_ms": winner.elapsed_ms,
+            "cross_val_passed": winner.cross_val_passed,
+            "cross_val_failed": winner.cross_val_failed,
         },
         "outcomes": _serialize(outcomes),
         "total_elapsed_ms": total_elapsed,

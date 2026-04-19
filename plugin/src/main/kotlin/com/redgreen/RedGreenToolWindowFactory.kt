@@ -301,10 +301,14 @@ class RedGreenToolWindow(private val project: Project) {
         while (agentTableModel.rowCount > 0) agentTableModel.removeRow(0)
     }
 
-    /** Phase label combines status + elapsed_ms + cross-val score. */
+    /** Phase label combines status + elapsed_ms + cross-val + regression scores. */
     private fun phaseLabel(a: AgentResult): String {
         val totalCV = a.cross_val_passed + a.cross_val_failed
-        val cvHint = if (totalCV > 0) " · ${a.cross_val_passed}/$totalCV peer tests" else ""
+        val cvHint = if (totalCV > 0) " · ${a.cross_val_passed}/$totalCV peer" else ""
+        val totalReg = a.regression_passed + a.regression_failed
+        val regHint = if (totalReg > 0) " · ${a.regression_passed}/$totalReg regression" else ""
+        val fallbackFired = (a.eliminated_reason ?: "").contains("regression fallback")
+        val fallbackHint = if (fallbackFired) " (fallback · broke ${a.regression_failed})" else ""
         return when {
             a.status == "pending" && a.elapsed_ms == 0 -> "waiting for model…"
             a.status == "pending" && a.elapsed_ms > 0 -> "model done · running RED gate"
@@ -312,7 +316,12 @@ class RedGreenToolWindow(private val project: Project) {
             a.status == "red_failed" -> "RED ✗ failed"
             a.status == "green_ok" -> {
                 val hackHint = if (a.cross_val_passed > 0 && a.cross_val_failed >= a.cross_val_passed) " (weak)" else ""
-                if (a.agent == winnerAgentName) "🏆 WINNER · GREEN ✓$cvHint" else "GREEN ✓$cvHint$hackHint"
+                if (a.agent == winnerAgentName) "🏆 WINNER · GREEN ✓$cvHint$regHint$fallbackHint"
+                else "GREEN ✓$cvHint$regHint$hackHint$fallbackHint"
+            }
+            a.status == "regression_failed" -> {
+                val broke = if (a.regression_failed > 0) a.regression_failed else 1
+                "GREEN ✓$cvHint · REGRESSION ✗ broke $broke existing test(s)"
             }
             a.status == "green_failed" -> {
                 val why = a.eliminated_reason ?: ""
@@ -408,6 +417,7 @@ private class StatusCellRenderer(
         if (value is String) {
             foreground = when {
                 value.startsWith("🏆") -> JBColor(0xB88800, 0xE0B84B)
+                value.contains("REGRESSION ✗") -> JBColor(0xE04B4B, 0xE04B4B)
                 value.startsWith("GREEN ✓") -> JBColor(0x3FB950, 0x3FB950)
                 value.startsWith("RED ✓") -> JBColor(0xCF8A4B, 0xE0A05A)
                 value.contains("✗") || value == "model error" -> JBColor(0xE04B4B, 0xE04B4B)

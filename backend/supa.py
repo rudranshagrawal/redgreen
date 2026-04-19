@@ -54,6 +54,9 @@ def upsert_agent(
     rationale: str | None = None,
     cross_val_passed: int | None = None,
     cross_val_failed: int | None = None,
+    regression_passed: int | None = None,
+    regression_failed: int | None = None,
+    regression_ms: int | None = None,
 ) -> None:
     payload: dict[str, Any] = {
         "episode_id": episode_id,
@@ -71,14 +74,36 @@ def upsert_agent(
         payload["cross_val_passed"] = cross_val_passed
     if cross_val_failed is not None:
         payload["cross_val_failed"] = cross_val_failed
+    if regression_passed is not None:
+        payload["regression_passed"] = regression_passed
+    if regression_failed is not None:
+        payload["regression_failed"] = regression_failed
+    if regression_ms is not None:
+        payload["regression_ms"] = regression_ms
     try:
         client().table("agents").upsert(payload, on_conflict="episode_id,agent").execute()
     except Exception as e:  # noqa: BLE001
-        # Schema v3 not applied yet? Fall back to legacy payload (drop the new fields).
         msg = str(e)
-        if "cross_val" in msg and ("column" in msg.lower() or "does not exist" in msg.lower()):
+        lower = msg.lower()
+        # Schema v4 not applied yet? Drop regression fields and retry.
+        if "regression" in msg and ("column" in lower or "does not exist" in lower):
+            payload.pop("regression_passed", None)
+            payload.pop("regression_failed", None)
+            payload.pop("regression_ms", None)
+            try:
+                client().table("agents").upsert(payload, on_conflict="episode_id,agent").execute()
+                return
+            except Exception as e2:  # noqa: BLE001
+                msg = str(e2)
+                lower = msg.lower()
+        # Schema v3 not applied? Drop cross-val too and retry once more. Also
+        # drop any stray regression fields so we don't re-trip the v4 branch.
+        if "cross_val" in msg and ("column" in lower or "does not exist" in lower):
             payload.pop("cross_val_passed", None)
             payload.pop("cross_val_failed", None)
+            payload.pop("regression_passed", None)
+            payload.pop("regression_failed", None)
+            payload.pop("regression_ms", None)
             client().table("agents").upsert(payload, on_conflict="episode_id,agent").execute()
         else:
             raise

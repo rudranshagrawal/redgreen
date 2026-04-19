@@ -225,7 +225,7 @@ def select_agents_for(request: AnalyzeRequest, *, seed: int | None = None) -> li
 @dataclass
 class AgentOutcome:
     spec: AgentSpec
-    status: str  # pending | red_ok | red_failed | green_ok | green_failed | error
+    status: str  # pending | red_ok | red_failed | green_ok | green_failed | regression_failed | error
     elapsed_ms: int = 0
     files_touched: int = 0
     eliminated_reason: Optional[str] = None
@@ -237,6 +237,9 @@ class AgentOutcome:
     green_ms: int = 0
     cross_val_passed: int = 0
     cross_val_failed: int = 0
+    regression_passed: int = 0
+    regression_failed: int = 0
+    regression_ms: int = 0
 
 
 def _slug(s: str) -> str:
@@ -400,6 +403,77 @@ async def _phase2_cross_validate(
     return final
 
 
+# -------- phase 2.5: regression gate --------
+
+async def _phase25_regression(
+    outcome: AgentOutcome,
+    request: AnalyzeRequest,
+    episode_id: str,
+) -> AgentOutcome:
+    """Apply this agent's patch on a fresh snapshot and run ONLY the seed's
+    pre-existing test suite — no injected peer tests. Any failure means the
+    patch fixed its target bug but broke something else in the codebase; we
+    disqualify it (strict), unless *every* survivor fails regression, in
+    which case the caller promotes the least-broken one back to green_ok
+    (soft fallback).
+    """
+    spec = outcome.spec
+    tag = f"{spec.name:<13}"
+
+    snap = _prepare_snapshot(pathlib.Path(request.repo_snapshot_path))
+    try:
+        reg = await run_in_docker(
+            test_code=None,
+            test_files=None,
+            patch=outcome.patch,
+            repo_snapshot_path=str(snap),
+        )
+    finally:
+        shutil.rmtree(snap, ignore_errors=True)
+
+    total_elapsed = outcome.gen_ms + outcome.red_ms + outcome.green_ms + reg.duration_ms
+
+    # Merge fresh regression data into the existing outcome fields.
+    outcome.regression_passed = reg.passed
+    outcome.regression_failed = reg.failed + reg.errors
+    outcome.regression_ms = reg.duration_ms
+    outcome.elapsed_ms = total_elapsed
+
+    print(
+        f"  {tag} REGRESS  {reg.passed} passed, {reg.failed} failed, {reg.errors} errors "
+        f"({reg.duration_ms}ms, status={reg.status})",
+        flush=True,
+    )
+
+    if reg.status == "REGRESSION_FAILED" or outcome.regression_failed > 0:
+        outcome.status = "regression_failed"
+        outcome.eliminated_reason = (
+            f"regression: broke {outcome.regression_failed} pre-existing test(s) "
+            f"({reg.passed} still pass) — {reg.stdout[-160:]}"
+        )
+    elif reg.status == "ERROR":
+        # Pytest couldn't run cleanly against the patched code — treat as broken too.
+        outcome.status = "regression_failed"
+        outcome.regression_failed = max(outcome.regression_failed, 1)
+        outcome.eliminated_reason = f"regression: pytest error — {reg.stdout[-160:]}"
+    # else: status stays "green_ok" — patch didn't break anything.
+
+    supa.upsert_agent(
+        episode_id=episode_id, agent=spec.name, model=spec.model,
+        status=outcome.status, elapsed_ms=outcome.elapsed_ms,
+        files_touched=outcome.files_touched,
+        eliminated_reason=outcome.eliminated_reason,
+        test_code=outcome.test_code, patch_unified_diff=outcome.patch,
+        rationale=outcome.rationale,
+        cross_val_passed=outcome.cross_val_passed,
+        cross_val_failed=outcome.cross_val_failed,
+        regression_passed=outcome.regression_passed,
+        regression_failed=outcome.regression_failed,
+        regression_ms=outcome.regression_ms,
+    )
+    return outcome
+
+
 # -------- syntax error fast-path --------
 
 _SYNTAX_FIX_SYSTEM = """\
@@ -530,13 +604,45 @@ def test_{module_stem}_parses():
 
 # -------- race all agents --------
 
-def _rank_by_cross_val(outcomes: list[AgentOutcome]) -> list[AgentOutcome]:
-    """Cross-validation ordering: most peer tests passed, then fewest
-    files touched, then fastest wall-clock. Used both as the fallback
-    ranking and as the candidate shortlist for the quality judge."""
+def _rank_survivors(outcomes: list[AgentOutcome]) -> list[AgentOutcome]:
+    """Survivor ordering: patches that passed both cross-val and regression,
+    sorted by most peer tests passed, most existing tests still passing,
+    fewest files touched, fastest wall-clock.
+    """
     survivors = [o for o in outcomes if o.status == "green_ok"]
-    survivors.sort(key=lambda o: (-o.cross_val_passed, o.files_touched, o.elapsed_ms))
+    survivors.sort(key=lambda o: (
+        -o.cross_val_passed,
+        -o.regression_passed,
+        o.files_touched,
+        o.elapsed_ms,
+    ))
     return survivors
+
+
+def _soft_fallback(outcomes: list[AgentOutcome]) -> Optional[AgentOutcome]:
+    """If every candidate broke something, pick the least-broken one and
+    promote it back to green_ok with an explicit note. Never return
+    no_winner purely because everyone was imperfect."""
+    regressed = [o for o in outcomes if o.status == "regression_failed"]
+    if not regressed:
+        return None
+    # Prefer fewest regression failures, then most cross-val passes, then fewest files.
+    regressed.sort(key=lambda o: (
+        o.regression_failed,
+        -o.cross_val_passed,
+        o.files_touched,
+        o.elapsed_ms,
+    ))
+    picked = regressed[0]
+    picked.status = "green_ok"
+    note = f" (regression fallback · broke {picked.regression_failed} pre-existing test(s))"
+    picked.eliminated_reason = (picked.eliminated_reason or "") + note
+    print(
+        f"  FALLBACK promoted {picked.spec.name} / {picked.spec.model} "
+        f"(regression {picked.regression_failed}F, cross-val {picked.cross_val_passed}P) — no clean winners",
+        flush=True,
+    )
+    return picked
 
 
 async def _judge_and_rank(
@@ -548,7 +654,7 @@ async def _judge_and_rank(
     exception vs generic, match codebase conventions). The cross-val
     score is the tiebreak if the judge returns something we can't use.
     """
-    ranked = _rank_by_cross_val(outcomes)
+    ranked = _rank_survivors(outcomes)
     if not ranked:
         return None, None
     if len(ranked) == 1:
@@ -567,6 +673,8 @@ async def _judge_and_rank(
             "patch": o.patch,
             "cross_val_passed": o.cross_val_passed,
             "cross_val_failed": o.cross_val_failed,
+            "regression_passed": o.regression_passed,
+            "regression_failed": o.regression_failed,
             "files_touched": o.files_touched,
         }
         for o in ranked[:3]
@@ -578,8 +686,8 @@ async def _judge_and_rank(
         if judge_pick is not None:
             print(
                 f"  JUDGE    picked {judge_pick.spec.name} "
-                f"(cross-val {judge_pick.cross_val_passed}P, judge {verdict.elapsed_ms}ms): "
-                f"{verdict.reasoning[:160]}",
+                f"(cross-val {judge_pick.cross_val_passed}P, regression {judge_pick.regression_passed}P, "
+                f"judge {verdict.elapsed_ms}ms): {verdict.reasoning[:160]}",
                 flush=True,
             )
             return judge_pick, verdict
@@ -650,11 +758,26 @@ async def run_episode(
         _phase2_cross_validate(o, combined_tests, request, episode_id) for o in red_passers
     ])
 
+    # Phase 2.5: regression gate. Each cross-val survivor's patch runs against
+    # ONLY the seed's pre-existing tests. A clean fix passes; a hack or a
+    # patch with a side-effect gets disqualified. Strict-with-soft-fallback:
+    # if every survivor fails regression we still pick the least-broken one,
+    # so the plugin always has something to apply.
+    cv_survivors = [o for o in phase2 if o.status == "green_ok"]
+    if cv_survivors:
+        print(f"\n=== phase 2.5: regression gate on {len(cv_survivors)} survivor(s) ===", flush=True)
+        await asyncio.gather(*[
+            _phase25_regression(o, request, episode_id) for o in cv_survivors
+        ])
+
+        if all(o.status == "regression_failed" for o in cv_survivors):
+            _soft_fallback(cv_survivors)
+
     # Eliminated-at-phase-1 agents keep their earlier outcomes; merge for the response.
     eliminated = [o for o in phase1 if o.status != "red_ok"]
     outcomes = eliminated + phase2
 
-    # Phase 3: quality judge — picks the most idiomatic fix among top cross-val survivors.
+    # Phase 3: quality judge — picks the most idiomatic fix among top survivors.
     winner, verdict = await _judge_and_rank(request, outcomes)
     total_elapsed = int((time.monotonic() - started) * 1000)
 
@@ -678,6 +801,9 @@ async def run_episode(
             rationale=(winner.rationale or "") + judge_note,
             cross_val_passed=winner.cross_val_passed,
             cross_val_failed=winner.cross_val_failed,
+            regression_passed=winner.regression_passed,
+            regression_failed=winner.regression_failed,
+            regression_ms=winner.regression_ms,
         )
 
     supa.finalize_episode(
@@ -688,6 +814,7 @@ async def run_episode(
     print(
         f"\nwinner: {winner.spec.name} / {winner.spec.model} "
         f"(cross-val {winner.cross_val_passed}P/{winner.cross_val_failed}F, "
+        f"regression {winner.regression_passed}P/{winner.regression_failed}F, "
         f"files={winner.files_touched}, elapsed={winner.elapsed_ms}ms) "
         f"total_ms={total_elapsed}",
         flush=True,
@@ -699,6 +826,8 @@ async def run_episode(
             "files_touched": winner.files_touched, "total_elapsed_ms": winner.elapsed_ms,
             "cross_val_passed": winner.cross_val_passed,
             "cross_val_failed": winner.cross_val_failed,
+            "regression_passed": winner.regression_passed,
+            "regression_failed": winner.regression_failed,
             "judge_reasoning": verdict.reasoning if verdict else "",
         },
         "outcomes": _serialize(outcomes),
@@ -712,6 +841,10 @@ def _serialize(outcomes: list[AgentOutcome]) -> list[dict]:
             "agent": o.spec.name, "model": o.spec.model, "status": o.status,
             "elapsed_ms": o.elapsed_ms, "files_touched": o.files_touched,
             "eliminated_reason": o.eliminated_reason,
+            "cross_val_passed": o.cross_val_passed,
+            "cross_val_failed": o.cross_val_failed,
+            "regression_passed": o.regression_passed,
+            "regression_failed": o.regression_failed,
         }
         for o in outcomes
     ]

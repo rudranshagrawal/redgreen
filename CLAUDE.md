@@ -19,9 +19,11 @@ Built at the JetBrains Codex Hackathon 2026-04-18 / 2026-04-19. Submission due S
 ## The 60-second demo script (this IS the spec)
 
 The one-sentence pitch to land first: **"Every patch has to survive the
-runner, pass the other agents' tests, and win code review — from another
-LLM trained on what makes a fix idiomatic."** Three layers of defense:
-**runner → peers → review.** Emphasize them as the beats unfold.
+runner, pass the other agents' tests, *not break the repo's own existing
+tests*, and then win code review — from another LLM trained on what makes
+a fix idiomatic."** Four layers of defense:
+**runner → peers → regression → review.** Emphasize them as the beats
+unfold.
 
 Every file in this repo earns its place by serving this demo:
 
@@ -29,13 +31,17 @@ Every file in this repo earns its place by serving this demo:
 2. (0:05) Debug → exception: `TypeError: refund_amount must not be None`.
 3. (0:08) Tool window: "RedGreen racing 4 agents..." — 4 lanes populate from the router.
 4. (0:14) **This is the money beat.** As the race resolves, the phase column
-   shows the three layers doing their job:
-   - One row: `GREEN ✗ · 1/4 peer tests (hacked literal?)` — the runner said
+   shows the four layers doing their job:
+   - One row: `GREEN ✗ · 1/4 peer (hacked literal?)` — the runner said
      "your patch compiles" but peers called it out as a hack. Point at it.
-   - Winner row: `🏆 WINNER · GREEN ✓ · 4/4 peer tests`.
+   - A second row: `GREEN ✓ · 3/4 peer · REGRESSION ✗ broke 1 existing test(s)` —
+     passed peers' tests but broke a happy-path test already in the repo.
+     Say: "CI would have caught this. We caught it in 2 seconds."
+   - Winner row: `🏆 WINNER · GREEN ✓ · 4/4 peer · 2/2 regression`.
    - Below the table: `[Judge] Candidate X addresses the cause rather than
      silencing the symptom; matches the project's RefundError convention.`
-   Say out loud: "Runner caught syntax. Peers caught hacks. Judge caught style."
+   Say out loud: "Runner caught syntax. Peers caught hacks. Regression caught
+   side-effects. Judge caught style."
 5. (0:22) Gutter inlay appears at the failing line: `⚡ RedGreen: fix ready · click`.
 6. (0:26) Click the inlay. Patch applied. Test file created.
 7. (0:30) Cut to Vercel leaderboard: hero stats, the "How it works" strip,
@@ -56,9 +62,12 @@ If a change doesn't serve this demo, it doesn't ship this weekend.
 - **"How does it learn?"** — "Every episode's winner writes to a `(repo_hash,
   agent, model)` table. The next episode reads it and biases model assignments
   toward historical winners on that codebase. Cold start falls back to random."
-- **"Why three gates instead of one?"** — "Runner proves the patch compiles
+- **"Why four gates instead of one?"** — "Runner proves the patch compiles
   and passes a test. Cross-val proves it's robust to other agents' tests.
-  Judge proves it's idiomatic. Each layer filters a different failure mode."
+  Regression proves it didn't break anything else in the repo. Judge proves
+  it's idiomatic. Each layer filters a different failure mode — the
+  regression gate specifically is what stops a 'fix' that silently breaks
+  an unrelated feature from ever reaching the gutter."
 - **"What stops a model from writing a test that only its own patch passes?"**
   — "Cross-val. Every patch runs against every agent's tests combined.
   A patch that only satisfies its own test scores 1/4 and loses."
@@ -78,7 +87,7 @@ AnalyzeResponse: episode_id
 # Backend -> Runner (internal)
 RunRequest:  episode_id, agent, test_code,
              patch_unified_diff (Optional), repo_snapshot_path
-RunResponse: status ("RED"|"GREEN"|"ERROR"), stdout, duration_ms
+RunResponse: status ("RED"|"GREEN"|"REGRESSION_FAILED"|"ERROR"), stdout, duration_ms
 
 # Plugin <- Backend (poll)
 StatusResponse: episode_id, state ("racing"|"completed"|"no_winner"),

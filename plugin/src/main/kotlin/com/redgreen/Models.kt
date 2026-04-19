@@ -21,12 +21,14 @@ data class AnalyzeResponse(val episode_id: String)
 data class AgentResult(
     val agent: String,
     val model: String,
-    val status: String,          // pending | red_ok | red_failed | green_ok | green_failed | error
+    val status: String,          // pending | red_ok | red_failed | green_ok | green_failed | regression_failed | error
     val elapsed_ms: Int,
     val files_touched: Int = 0,
     val eliminated_reason: String? = null,
     val cross_val_passed: Int = 0,
     val cross_val_failed: Int = 0,
+    val regression_passed: Int = 0,
+    val regression_failed: Int = 0,
 )
 
 data class Winner(

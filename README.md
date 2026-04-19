@@ -2,11 +2,12 @@
 
 **The IDE catches its own bugs and learns which model to trust.**
 
-A JetBrains plugin that, when the debugger trips an exception, races up to 4 models in parallel from a catalog of 12 hypothesis lenses. Every patch has to survive three layers of defense:
+A JetBrains plugin that, when the debugger trips an exception, races up to 4 models in parallel from a catalog of 12 hypothesis lenses. Every patch has to survive four layers of defense:
 
 1. **Runner** — pytest inside Docker. Did the patch compile and pass a test?
 2. **Peers** — cross-validation. Did the patch also pass the *other* agents' tests?
-3. **Review** — a quality judge (small LLM call) picks the most idiomatic survivor — rejects "hacks" like literal-value swaps that silence the crash without addressing the cause.
+3. **Regression** — the repo's own existing test suite. Did the patch break anything that already worked?
+4. **Review** — a quality judge (small LLM call) picks the most idiomatic survivor — rejects "hacks" like literal-value swaps that silence the crash without addressing the cause.
 
 Every episode logs to Supabase. A per-codebase leaderboard reweights the agent pool over time — episode 1 shuffles randomly, episode 20 reads history and picks the model that won on *this codebase* first.
 

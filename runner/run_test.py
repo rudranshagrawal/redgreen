@@ -15,9 +15,12 @@ Returns a JSON RunResponse on stdout:
     {"status": "RED"|"GREEN"|"ERROR", "stdout": "...", "duration_ms": int}
 
 Gate semantics:
-  - No patch provided -> RED gate: expect pytest to FAIL on the new test.
-  - Patch provided    -> GREEN gate: expect pytest to PASS on the new test
-                                     AND all pre-existing tests still pass.
+  - No patch                         -> RED gate: expect pytest to FAIL on the new test.
+  - Patch + test_code/test_files     -> GREEN / cross-val gate: return raw pass
+                                        counts so the caller can rank survivors.
+  - Patch, no tests injected         -> REGRESSION gate: run only the seed's own
+                                        `tests/`; rc=1 is a legit "patch broke
+                                        something" signal, not a fatal error.
 """
 
 from __future__ import annotations
@@ -205,6 +208,8 @@ def main() -> int:
     rc, output, elapsed_ms = _run_pytest(repo_root, "tests/")
     passed, failed, errors = _parse_pytest_counts(output)
 
+    tests_injected = bool(req.get("test_code") or req.get("test_files"))
+
     if patch is None:
         # RED gate semantics unchanged.
         if rc == 1 and "test_redgreen_generated" in output:
@@ -215,11 +220,20 @@ def main() -> int:
             status = "ERROR"
         else:
             status = "ERROR"
-    else:
-        # GREEN gate. In cross-validation mode the caller wants the raw pass
-        # count regardless of status; in legacy mode keep the "all pass or bust"
-        # semantics so older flows still work.
+    elif tests_injected:
+        # GREEN / cross-val gate. Caller ranks by raw pass count; collapse
+        # anything non-zero to ERROR only when pytest itself couldn't run.
         status = "GREEN" if rc in (0, 5) else "ERROR"
+    else:
+        # REGRESSION gate. Patch + only the seed's existing tests. rc=1 here
+        # means the patch broke a pre-existing test — that's the signal we
+        # need, not an error condition.
+        if rc in (0, 5):
+            status = "GREEN"
+        elif rc == 1:
+            status = "REGRESSION_FAILED"
+        else:
+            status = "ERROR"
 
     print(json.dumps({
         "status": status,

@@ -14,7 +14,7 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 # Agent catalog — the 4 originals plus 8 M5-era hypotheses. A dynamic
 # router selects up to 4 of these per episode based on the stacktrace.
@@ -32,7 +32,7 @@ Agent = Literal[
     "auth_permission",
     "dependency_missing",
 ]
-RunStatus = Literal["RED", "GREEN", "ERROR"]
+RunStatus = Literal["RED", "GREEN", "REGRESSION_FAILED", "ERROR"]
 EpisodeState = Literal["racing", "completed", "no_winner"]
 
 
@@ -87,12 +87,17 @@ class RunResponse(BaseModel):
 class AgentResult(BaseModel):
     agent: Agent
     model: str
-    status: Literal["pending", "red_ok", "red_failed", "green_ok", "green_failed", "error"]
+    status: Literal[
+        "pending", "red_ok", "red_failed", "green_ok", "green_failed",
+        "regression_failed", "error",
+    ]
     elapsed_ms: int = 0
     eliminated_reason: Optional[str] = None
     files_touched: int = 0
     cross_val_passed: int = 0
     cross_val_failed: int = 0
+    regression_passed: int = 0
+    regression_failed: int = 0
 
 
 class Winner(BaseModel):

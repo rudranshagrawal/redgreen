@@ -112,3 +112,63 @@ just before the race resolves.
 > not break the repo's existing tests, and then win code review — from
 > another LLM trained on what makes a fix idiomatic. Four layers of
 > defense. Sixty seconds, zero buttons, one click to apply."
+
+---
+
+## Optional coda · "What's next: a local test-writer" (10-25s)
+
+Slots in after beat 0:48 (recent races section, on the leaderboard) or
+just before the end card. The **framing hook** is that every RedGreen
+race opens with four models writing a failing test — a step that's
+cheap per episode but *expensive at CI scale*. That's the surface a
+specialized local model replaces.
+
+Pick the length that fits your edit:
+
+### Short (≈12s · 30 words)
+Screen: stay on leaderboard, or cut to a slide with the four-gate diagram + a new "test generation: local" badge on gate 1.
+
+> "One more thing. Every race starts with models writing a failing
+> test. We fine-tuned a small local model for that step. Zero API
+> cost. Zero code leaves the machine. CI-ready."
+
+### Medium (≈20s · 50 words · **recommended**)
+Screen: cut to a static "what's next" slide showing the four gates, with the first gate (Race) highlighted and an inset label: `local · RL-tuned test generator`.
+
+> "One more thing. Every RedGreen race opens with four models writing
+> a failing test. We fine-tuned a small model specifically for that —
+> RL-trained on test generation. Runs locally. Zero API bill. Zero
+> code leaves your machine. Drop it in a pre-commit hook and grow
+> your regression suite on every PR — free."
+
+### Long (≈28s · 70 words)
+Screen: two-shot. First a terminal clip of the local model running cold (no `curl`, no API call visible), then pan to the RedGreen leaderboard's regression column lighting up.
+
+> "One more thing. Every RedGreen race opens with four models writing
+> a failing test. At CI scale, that's the expensive part — so we
+> fine-tuned a small model specifically for test generation, RL'd on
+> exactly this workflow. It punches above its weight because it's
+> purpose-built, not general. Runs locally: no API key, no per-token
+> bill, proprietary code never leaves the developer's machine. Drop
+> it in a pre-commit hook and every PR grows the regression suite
+> RedGreen checks against — for free."
+
+### Why this lands (internal notes, don't read aloud)
+
+- **Ties back to something the audience literally just saw**: the race
+  we demoed had 4 models each writing a failing test. That's gate 1 of
+  the pipeline. Replacing *that* with a local model is a narrow,
+  believable claim — not "we'll replace everything with a local model."
+- **Connects to the regression gate we just shipped**: a local test
+  generator running in pre-commit hooks *feeds* the regression gate
+  over time. Every PR that lands grows the suite. The story becomes a
+  flywheel, not a one-shot feature.
+- **Sponsor relevance**: OpenAI / Nebius stay on slots 2-4 (the
+  patching and judging LLMs). Only the test-writing role becomes local.
+  The frontier-LLM sponsors still look important.
+
+### If you also want to update the one-liner pitch
+
+> "Runner. Peers. Regression. Review. Four gates, one click to apply —
+> and the test-writing step that opens every race runs on a purpose-
+> built local model. Zero API spend, nothing leaves the machine."

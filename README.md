@@ -2,17 +2,24 @@
 
 **The IDE catches its own bugs and learns which model to trust.**
 
-A JetBrains plugin that, when the debugger trips an exception, races 4 different models in parallel to produce `(failing test, patch, rationale)`. A Docker pytest runner is the referee: candidates must reproduce the bug RED, then flip it GREEN. Winner surfaces as a gutter suggestion — Tab to apply.
+A JetBrains plugin that, when the debugger trips an exception, races up to 4 models in parallel from a catalog of 12 hypothesis lenses. Every patch has to survive three layers of defense:
 
-Every episode logs to Supabase. A per-codebase leaderboard reweights the agent pool over time. Episode 1 knows nothing. Episode 20 picks the right model first try.
+1. **Runner** — pytest inside Docker. Did the patch compile and pass a test?
+2. **Peers** — cross-validation. Did the patch also pass the *other* agents' tests?
+3. **Review** — a quality judge (small LLM call) picks the most idiomatic survivor — rejects "hacks" like literal-value swaps that silence the crash without addressing the cause.
+
+Every episode logs to Supabase. A per-codebase leaderboard reweights the agent pool over time — episode 1 shuffles randomly, episode 20 reads history and picks the model that won on *this codebase* first.
 
 ## Stack
 
-- **Models:** GPT-5 Codex (OpenAI), Llama-3.3-70B, Qwen2.5-Coder-32B, DeepSeek-V3 (Nebius Token Factory)
+- **Models:** GPT-5 mini (OpenAI), Llama-3.3-70B, Qwen3-32B, DeepSeek-V3.2-fast (Nebius Token Factory) — shuffled across lenses per episode
+- **Router:** exception-type + frame-keyword scorer (`backend/router.py`) picks the top 4 of 12 hypothesis lenses per episode
 - **Referee:** pytest inside a Docker sandbox — no mocks
-- **Backend:** FastAPI
-- **Plugin:** JetBrains Platform (Kotlin), target PyCharm 2024.3+
-- **Leaderboard:** Next.js on Vercel, Supabase as the datastore
+- **Judge:** GPT-5 mini again, called once per episode on survivor patches, 12s hard timeout
+- **Backend:** FastAPI with async background tasks
+- **Plugin:** JetBrains Platform (Kotlin), target PyCharm 2024.3+; PSI fallback for SyntaxErrors; inline editor inlay + click-to-apply
+- **Leaderboard:** Next.js 15 on Vercel, Supabase as the datastore
+- **Indexer:** plugin-side background scan of the user's Python project, feeds codebase conventions into every agent's prompt
 
 ## Demo
 

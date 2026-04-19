@@ -18,19 +18,54 @@ Built at the JetBrains Codex Hackathon 2026-04-18 / 2026-04-19. Submission due S
 
 ## The 60-second demo script (this IS the spec)
 
+The one-sentence pitch to land first: **"Every patch has to survive the
+runner, pass the other agents' tests, and win code review — from another
+LLM trained on what makes a fix idiomatic."** Three layers of defense:
+**runner → peers → review.** Emphasize them as the beats unfold.
+
 Every file in this repo earns its place by serving this demo:
 
 1. (0:00) Open PyCharm with `seeds/null_guard/`. RedGreen plugin visible in sidebar.
 2. (0:05) Debug → exception: `TypeError: refund_amount must not be None`.
-3. (0:08) Tool window: "RedGreen racing 4 agents..." — 4 rows stream live.
-4. (0:14) Row-by-row outcomes: 3 eliminated, `null_guard` GREEN in ~8s.
-5. (0:22) Gutter suggestion appears. Preview shows +3/-1.
-6. (0:26) Tab → patch applied, test file created.
-7. (0:30) Cut to Vercel leaderboard: "Episode 7 · null_guard · Codex · 8.2s".
-8. (0:38) Cut back. Second bug. Tool window: "leaderboard predicts: null_guard". Wins first attempt.
-9. (0:50) End card: `github.com/rudranshagrawal/redgreen`.
+3. (0:08) Tool window: "RedGreen racing 4 agents..." — 4 lanes populate from the router.
+4. (0:14) **This is the money beat.** As the race resolves, the phase column
+   shows the three layers doing their job:
+   - One row: `GREEN ✗ · 1/4 peer tests (hacked literal?)` — the runner said
+     "your patch compiles" but peers called it out as a hack. Point at it.
+   - Winner row: `🏆 WINNER · GREEN ✓ · 4/4 peer tests`.
+   - Below the table: `[Judge] Candidate X addresses the cause rather than
+     silencing the symptom; matches the project's RefundError convention.`
+   Say out loud: "Runner caught syntax. Peers caught hacks. Judge caught style."
+5. (0:22) Gutter inlay appears at the failing line: `⚡ RedGreen: fix ready · click`.
+6. (0:26) Click the inlay. Patch applied. Test file created.
+7. (0:30) Cut to Vercel leaderboard: hero stats, the "How it works" strip,
+   the per-codebase block showing `predicts null_guard · 91% confidence`.
+   Every row is a real episode from tonight's pre-seed.
+8. (0:38) Cut back. Second bug on the same repo. Console line flashes:
+   `[feedback] null_guard←gpt-5-mini (10W) | ...`. Say: "It read the
+   leaderboard. It's picking the model that won here before." Race resolves
+   in half the time because the priors were right.
+9. (0:50) End card: `github.com/rudranshagrawal/redgreen · redgreen-leaderboard.vercel.app`.
 
 If a change doesn't serve this demo, it doesn't ship this weekend.
+
+### Q&A prep (memorize one-liners)
+
+- **"Why only 4 agents out of 12?"** — "Latency and API cost. The router's
+  score is strong enough that beyond the top 4 we don't see marginal wins."
+- **"How does it learn?"** — "Every episode's winner writes to a `(repo_hash,
+  agent, model)` table. The next episode reads it and biases model assignments
+  toward historical winners on that codebase. Cold start falls back to random."
+- **"Why three gates instead of one?"** — "Runner proves the patch compiles
+  and passes a test. Cross-val proves it's robust to other agents' tests.
+  Judge proves it's idiomatic. Each layer filters a different failure mode."
+- **"What stops a model from writing a test that only its own patch passes?"**
+  — "Cross-val. Every patch runs against every agent's tests combined.
+  A patch that only satisfies its own test scores 1/4 and loses."
+- **"Is the judge cheating? LLMs judging LLMs?"** — "The judge isn't
+  deciding correctness — the runner already did that. The judge only
+  breaks ties on *idiomaticness*, using general code-review principles.
+  The referee (pytest in Docker) is deterministic; the judge is flavor."
 
 ## Three wire contracts (frozen — see `contracts/schemas.py`)
 

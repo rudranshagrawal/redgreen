@@ -152,7 +152,9 @@ async def rank_survivors(
                 response_format={"type": "json_object"},
                 max_completion_tokens=4000,
             ),
-            timeout=45.0,
+            # Demo budget: hard cap at 12s. Judge on a small prompt usually
+            # returns in 3-6s; this is enough margin without blowing the demo.
+            timeout=12.0,
         )
     except asyncio.TimeoutError:
         return JudgeVerdict(
